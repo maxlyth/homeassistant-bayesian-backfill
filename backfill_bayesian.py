@@ -192,20 +192,24 @@ def _read_purge_keep_days(config_dir, db_path):
     return 10
 
 
+_WRITE_BATCH_SIZE = 500  # rows per DB commit to avoid blocking HA recorder
+
+
 @pyscript_executor
 def _write_bayesian_state_history(entity_id, rows, db_path):
     """Write synthetic state records (with probability attribute) to the states table.
 
-    rows: list of {"ts": float, "probability": float, "state": "on"|"off"}, sorted ascending.
+    rows: list of dicts sorted ascending by ts, each containing:
+        ts, probability, state, occurred_observation_entities, observations.
 
     Uses origin_idx=_BACKFILL_ORIGIN_IDX to mark synthetic rows so re-runs only
     delete/replace those, leaving real HA-recorded states untouched.
+
+    Commits in batches of _WRITE_BATCH_SIZE to avoid holding a write lock that
+    blocks the HA recorder.
     """
     if not rows:
         return 0
-
-    min_ts = rows[0]["ts"]
-    max_ts = rows[-1]["ts"]
 
     conn = sqlite3.connect(db_path, timeout=30)
     conn.row_factory = sqlite3.Row
@@ -217,7 +221,7 @@ def _write_bayesian_state_history(entity_id, rows, db_path):
             raise ValueError(f"No states_meta entry for {entity_id}")
         metadata_id = meta["metadata_id"]
 
-        # Use most recent real state as the attributes template
+        # Use most recent real state as the static attributes template
         recent = conn.execute(
             "SELECT sa.shared_attrs FROM states s "
             "LEFT JOIN state_attributes sa ON s.attributes_id = sa.attributes_id "
@@ -229,14 +233,8 @@ def _write_bayesian_state_history(entity_id, rows, db_path):
             raise ValueError(f"No existing real state for {entity_id} to use as attributes template")
         base_attrs = json.loads(recent["shared_attrs"])
 
-        # Delete only previously backfilled rows in the window (idempotent)
-        conn.execute(
-            "DELETE FROM states WHERE metadata_id = ? AND origin_idx = ? "
-            "AND last_updated_ts >= ? AND last_updated_ts <= ?",
-            (metadata_id, _BACKFILL_ORIGIN_IDX, min_ts, max_ts + 1),
-        )
-
         # Chain from the last real state before the window
+        min_ts = rows[0]["ts"]
         prev = conn.execute(
             "SELECT state_id FROM states WHERE metadata_id = ? AND last_updated_ts < ? "
             "ORDER BY last_updated_ts DESC LIMIT 1",
@@ -246,47 +244,66 @@ def _write_bayesian_state_history(entity_id, rows, db_path):
 
         inserted = 0
         prev_state_val = None
-        for row in rows:
-            ts = row["ts"]
-            prob = row["probability"]
-            state = row["state"]
 
-            attrs = dict(base_attrs)
-            attrs["probability"] = round(prob, 6)
-            attrs_json = json.dumps(attrs, separators=(",", ":"), sort_keys=False)
-            attrs_hash = hash(attrs_json) & 0x7FFFFFFFFFFFFFFF
+        for batch_start in range(0, len(rows), _WRITE_BATCH_SIZE):
+            batch = rows[batch_start:batch_start + _WRITE_BATCH_SIZE]
+            batch_min_ts = batch[0]["ts"]
+            batch_max_ts = batch[-1]["ts"]
 
-            existing_attr = conn.execute(
-                "SELECT attributes_id FROM state_attributes WHERE hash = ? AND shared_attrs = ?",
-                (attrs_hash, attrs_json),
-            ).fetchone()
-            if existing_attr:
-                attributes_id = existing_attr["attributes_id"]
-            else:
-                conn.execute(
-                    "INSERT INTO state_attributes (hash, shared_attrs) VALUES (?, ?)",
-                    (attrs_hash, attrs_json),
-                )
-                attributes_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-
-            last_changed_ts = ts if state != prev_state_val else None
-
+            # Delete previously backfilled rows in this batch's time range
             conn.execute(
-                """INSERT INTO states (
-                    state, last_updated_ts, last_changed_ts, last_reported_ts,
-                    old_state_id, attributes_id, context_id_bin, origin_idx, metadata_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    state, ts, last_changed_ts, ts,
-                    old_state_id, attributes_id, os.urandom(16),
-                    _BACKFILL_ORIGIN_IDX, metadata_id,
-                ),
+                "DELETE FROM states WHERE metadata_id = ? AND origin_idx = ? "
+                "AND last_updated_ts >= ? AND last_updated_ts <= ?",
+                (metadata_id, _BACKFILL_ORIGIN_IDX, batch_min_ts, batch_max_ts + 1),
             )
-            old_state_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-            prev_state_val = state
-            inserted += 1
 
-        conn.commit()
+            for row in batch:
+                ts = row["ts"]
+                prob = row["probability"]
+                state = row["state"]
+
+                # Build attributes: static base + dynamic per-row overlays
+                attrs = dict(base_attrs)
+                attrs["probability"] = round(prob, 6)
+                attrs["occurred_observation_entities"] = row.get(
+                    "occurred_observation_entities", []
+                )
+                attrs["observations"] = row.get("observations", [])
+                attrs_json = json.dumps(attrs, separators=(",", ":"), sort_keys=False)
+                attrs_hash = hash(attrs_json) & 0x7FFFFFFFFFFFFFFF
+
+                existing_attr = conn.execute(
+                    "SELECT attributes_id FROM state_attributes WHERE hash = ? AND shared_attrs = ?",
+                    (attrs_hash, attrs_json),
+                ).fetchone()
+                if existing_attr:
+                    attributes_id = existing_attr["attributes_id"]
+                else:
+                    conn.execute(
+                        "INSERT INTO state_attributes (hash, shared_attrs) VALUES (?, ?)",
+                        (attrs_hash, attrs_json),
+                    )
+                    attributes_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+                last_changed_ts = ts if state != prev_state_val else None
+
+                conn.execute(
+                    """INSERT INTO states (
+                        state, last_updated_ts, last_changed_ts, last_reported_ts,
+                        old_state_id, attributes_id, context_id_bin, origin_idx, metadata_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        state, ts, last_changed_ts, ts,
+                        old_state_id, attributes_id, os.urandom(16),
+                        _BACKFILL_ORIGIN_IDX, metadata_id,
+                    ),
+                )
+                old_state_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                prev_state_val = state
+                inserted += 1
+
+            conn.commit()
+
         return inserted
     finally:
         conn.close()
@@ -518,14 +535,12 @@ def _compute_bayesian_probability(prior, observations, obs_results):
 
 
 async def _backfill_single_bayesian(
-    entity_id, cfg, user_start_ts, end_ts, interval_sec, dry_run, debug, db_path, lat, lon,
-    write_history=True,
+    entity_id, cfg, user_start_ts, end_ts, dry_run, debug, db_path, lat, lon,
 ):
     """Core backfill logic for one Bayesian sensor. Returns count of rows computed."""
     observations = cfg.get("observations", [])
     prior = float(cfg.get("prior", 0.5))
     probability_threshold = float(cfg.get("probability_threshold", 0.5))
-    # Always log milestones at WARNING so they appear in the default HA log view.
     # Only per-timestamp debug detail uses the conditional level.
     debug_fn = log.warning if (dry_run or debug) else log.info
 
@@ -556,22 +571,22 @@ async def _backfill_single_bayesian(
     if user_start_ts is None:
         if dry_run or debug:
             # Safety cap: 10-minute window when dry_run/debug to avoid accidental full scans
-            resolved_start = (int(end_ts - 600) // interval_sec) * interval_sec
+            resolved_start = int(end_ts - 600)
         elif obs_entity_ids_list:
             raw_start = await _get_bayesian_window_start(obs_entity_ids_list, db_path)
             if raw_start is not None:
-                resolved_start = (int(raw_start) // interval_sec) * interval_sec
+                resolved_start = int(raw_start)
             else:
                 log.warning(
                     "backfill_bayesian: no observation entity history found for %s, "
                     "defaulting to 365 days ago (pass start_offset to override)",
                     entity_id,
                 )
-                resolved_start = (int(time.time() - 365 * 86400) // interval_sec) * interval_sec
+                resolved_start = int(time.time() - 365 * 86400)
         else:
-            resolved_start = (int(time.time() - 365 * 86400) // interval_sec) * interval_sec
+            resolved_start = int(time.time() - 365 * 86400)
     else:
-        resolved_start = (int(user_start_ts) // interval_sec) * interval_sec
+        resolved_start = int(user_start_ts)
 
     if resolved_start >= end_ts:
         log.warning("backfill_bayesian: %s — window is empty, nothing to do", entity_id)
@@ -584,16 +599,25 @@ async def _backfill_single_bayesian(
             obs_entity_ids_list, resolved_start, end_ts, load_attrs, db_path
         )
 
+    # Collect unique state-change timestamps from all observation timelines
+    event_timestamps = sorted({
+        ts for tl in timelines.values()
+        for ts in tl["ts"]
+        if resolved_start <= ts < end_ts
+    })
+    if not event_timestamps:
+        event_timestamps = [float(resolved_start)]
+
     log.warning(
-        "backfill_bayesian: %s — window=[%s → %s] interval=%dm "
-        "observations=%d entities=%d loaded=%d",
+        "backfill_bayesian: %s — window=[%s → %s] "
+        "observations=%d entities=%d loaded=%d events=%d",
         entity_id,
         datetime.fromtimestamp(resolved_start, tz=timezone.utc).isoformat(),
         datetime.fromtimestamp(end_ts, tz=timezone.utc).isoformat(),
-        interval_sec // 60,
         len(observations),
         len(obs_entity_ids_list),
         len(timelines),
+        len(event_timestamps),
     )
 
     # Build Jinja2 environment with historical mocks
@@ -611,13 +635,12 @@ async def _backfill_single_bayesian(
                     entity_id, i, exc,
                 )
 
-    # Main loop
+    # Main loop — iterate over observation entity state-change timestamps
     history_rows = []
     total_computed = 0
     debug_logged = 0
 
-    ts = int(resolved_start)
-    while ts < int(end_ts):
+    for ts in event_timestamps:
         ctx["ts"] = float(ts)
 
         obs_results = [
@@ -640,23 +663,41 @@ async def _backfill_single_bayesian(
             )
             debug_logged += 1
 
-        history_rows.append(
-            {
-                "ts": float(ts),
-                "probability": prob,
-                "state": "on" if prob >= probability_threshold else "off",
-            }
-        )
+        # Build per-timestamp dynamic attributes
+        occurred = []
+        obs_attrs = []
+        for i, obs in enumerate(observations):
+            obs_entry = dict(obs)
+            if obs_results[i] is True:
+                if obs.get("platform") in ("state", "numeric_state"):
+                    occurred.append(obs["entity_id"])
+                obs_entry.pop("observed", None)
+            else:
+                obs_entry["observed"] = False
+            obs_attrs.append(obs_entry)
+
+        history_rows.append({
+            "ts": float(ts),
+            "probability": prob,
+            "state": "on" if prob >= probability_threshold else "off",
+            "occurred_observation_entities": occurred,
+            "observations": obs_attrs,
+        })
         total_computed += 1
 
-        ts += interval_sec
-
-    # Write state history so probability attribute appears in the history graph
-    if write_history and not dry_run and history_rows:
+    # Write state history
+    if not dry_run and history_rows:
         inserted = await _write_bayesian_state_history(entity_id, history_rows, db_path)
         log.warning(
             "backfill_bayesian: %s — wrote %d state history row(s)",
             entity_id, inserted,
+        )
+    elif dry_run and history_rows:
+        log.warning(
+            "backfill_bayesian [dry_run]: %s — %d events, first=%s last=%s",
+            entity_id, len(history_rows),
+            datetime.fromtimestamp(history_rows[0]["ts"], tz=timezone.utc).isoformat(),
+            datetime.fromtimestamp(history_rows[-1]["ts"], tz=timezone.utc).isoformat(),
         )
 
     return total_computed
@@ -667,17 +708,17 @@ def backfill_bayesian_sensor(
     target_entity_id,
     start_offset=None,
     end_offset=None,
-    interval_minutes=60,
     dry_run=False,
     debug=False,
-    write_history=True,
 ):
     """yaml
 name: Backfill Bayesian Sensor History
 description: >
-  Retroactively computes Bayesian probability (0.0–1.0) for one or more binary
-  sensors using historical state data, then writes the results as state records
-  with the probability attribute so they appear in history graphs and ApexCharts.
+  Retroactively computes Bayesian probability for one or more binary sensors
+  using historical state data, then writes the results as state records with
+  the probability, occurred_observation_entities, and observations attributes
+  so they appear in history graphs and ApexCharts.
+  Computes at each observation entity state change (event-driven, not fixed interval).
   Supports glob patterns for target_entity_id (e.g. binary_sensor.bathroom_*
   or binary_sensor.* for all sensors).
   Always do a dry_run first. Re-running is safe — only backfill-written rows
@@ -715,15 +756,6 @@ fields:
       seconds: 0
     selector:
       duration:
-  interval_minutes:
-    description: >
-      Granularity in minutes. Default: 60 (hourly). Sub-hourly values are
-      supported but produce more state records.
-    required: false
-    default: 60
-    selector:
-      number:
-        mode: box
   dry_run:
     description: If true, log computed values but do not write to the database.
     required: false
@@ -738,22 +770,11 @@ fields:
     default: false
     selector:
       boolean:
-  write_history:
-    description: >
-      If true (default), write computed probability values as state records so
-      they appear in the history graph and ApexCharts attribute history.
-      Records are capped to the recorder retention window (purge_keep_days).
-      Re-running is safe — only backfill-written rows are replaced.
-    required: false
-    default: true
-    selector:
-      boolean:
 """
     task.unique("backfill_bayesian_sensor")
 
     config_dir = hass.config.config_dir
     db_path = os.path.join(config_dir, "home-assistant_v2.db")
-    interval_sec = int(interval_minutes) * 60
 
     # Load location for solar elevation computation
     lat, lon = await _load_location(config_dir)
@@ -790,7 +811,7 @@ fields:
 
     # Resolve end_ts once (shared across all sensors in a glob expansion)
     if end_ts is None:
-        end_ts = (now_ts // interval_sec) * interval_sec
+        end_ts = now_ts
 
     # Expand glob / validate entity_id
     entity_ids = await _get_bayesian_entity_ids(target_entity_id, config_dir)
@@ -820,8 +841,7 @@ fields:
             continue
 
         rows = await _backfill_single_bayesian(
-            eid, cfg, start_ts, end_ts, interval_sec, dry_run, debug, db_path, lat, lon,
-            write_history=write_history,
+            eid, cfg, start_ts, end_ts, dry_run, debug, db_path, lat, lon,
         )
         log.warning(
             "backfill_bayesian: %s — complete, computed=%d rows, dry_run=%s",

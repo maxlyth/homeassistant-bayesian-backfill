@@ -18,12 +18,15 @@ A pyscript service that retroactively recomputes Bayesian binary sensor state hi
 
 1. Resolves sensor config from `core.config_entries` (UI-created sensors) or by recursively scanning your YAML files (YAML-defined sensors).
 2. Bulk-loads all observation entity state histories from the `states` table in a single SQL query.
-3. For each interval timestamp, evaluates every observation (`state`, `numeric_state`, `template`) against the historical states using forward-fill.
-4. Template observations use a Jinja2 environment with mocked `states()`, `state_attr()`, and `now()` returning historical values. `state_attr('sun.sun', 'elevation')` is computed astronomically (pure Python, no `astral` dependency) from the lat/lon stored in your HA configuration.
-5. Runs the iterative Bayes update formula and computes the resulting probability (0.0-1.0).
-6. Writes synthetic state records to the `states` table with the computed `probability` attribute, so the values appear in history graphs and ApexCharts attribute-history cards.
+3. Collects all state-change timestamps across observation entities and iterates over them (event-driven -- no fixed interval).
+4. At each event timestamp, evaluates every observation (`state`, `numeric_state`, `template`) against the historical states using forward-fill. Template observations use a Jinja2 environment with mocked `states()`, `state_attr()`, and `now()` returning historical values. `state_attr('sun.sun', 'elevation')` is computed astronomically (pure Python, no `astral` dependency).
+5. Runs the iterative Bayes update formula to compute probability (0.0--1.0).
+6. Writes synthetic state records to the `states` table with reconstructed attributes:
+   - `probability` -- the computed value
+   - `occurred_observation_entities` -- which observation entities were active at that timestamp
+   - `observations` -- full observation list with `observed: false` on inactive ones
 
-All paths are resolved at runtime from `hass.config.config_dir`, so the script works on any HA installation regardless of where your config directory is located.
+All paths are resolved at runtime from `hass.config.config_dir`, so the script works on any HA installation.
 
 ---
 
@@ -63,15 +66,13 @@ If you already have a `pyscript:` section, add `allow_all_imports: true` inside 
 
 ### Step 3 -- Copy the script
 
-Copy `backfill_bayesian.py` into the `pyscript/` directory inside your HA config folder. The directory is created automatically the first time pyscript runs, but you can create it manually if it does not exist yet:
+Copy `backfill_bayesian.py` into the `pyscript/` directory inside your HA config folder:
 
 ```
 <config>/
   pyscript/
     backfill_bayesian.py
 ```
-
-The typical config directory location depends on your installation method:
 
 | Install type | Config directory |
 |---|---|
@@ -81,9 +82,7 @@ The typical config directory location depends on your installation method:
 
 ### Step 4 -- Reload pyscript
 
-You do not need a full HA restart. In the HA UI go to:
-
-**Developer Tools > YAML > Reload pyscript**
+In the HA UI: **Developer Tools > YAML > Reload pyscript**
 
 Or call the service directly:
 
@@ -93,11 +92,7 @@ action: pyscript.reload
 
 ### Step 5 -- Verify
 
-Go to **Developer Tools > Actions** and search for `pyscript.backfill_bayesian_sensor`. If it does not appear, check **Settings > System > Logs** for pyscript errors. The most common causes are:
-
-- `allow_all_imports: true` missing from `configuration.yaml`
-- A syntax error introduced by an edit to the script (HA will log the line number)
-- The script placed in the wrong directory (it must be directly inside `pyscript/`, not in a subdirectory)
+Go to **Developer Tools > Actions** and search for `pyscript.backfill_bayesian_sensor`. If it does not appear, check **Settings > System > Logs** for pyscript errors.
 
 ---
 
@@ -110,15 +105,13 @@ Go to **Developer Tools > Actions** and search for `pyscript.backfill_bayesian_s
 | `target_entity_id` | yes | -- | Entity ID or glob pattern (e.g. `binary_sensor.*`) |
 | `start_offset` | no | Earliest observation entity state | How far back from now to start the backfill window |
 | `end_offset` | no | Now | How far back from now to end the backfill window |
-| `interval_minutes` | no | `60` | Granularity in minutes |
 | `dry_run` | no | `false` | Log computed values without writing to the database |
-| `debug` | no | `false` | Log a per-observation breakdown for the first 10 timestamps |
-| `write_history` | no | `true` | Write computed probability as a state attribute to the `states` table. Re-running is safe -- only backfill-written rows are replaced; real HA-recorded states are never touched. Records older than `purge_keep_days` are skipped. |
+| `debug` | no | `false` | Log a per-observation breakdown for the first 10 event timestamps |
 
 ### Examples
 
 ```yaml
-# Single sensor -- dry run with debug output to validate before writing
+# Single sensor -- dry run with debug output
 action: pyscript.backfill_bayesian_sensor
 data:
   target_entity_id: binary_sensor.bathroom_occupied
@@ -136,7 +129,7 @@ data:
 ```
 
 ```yaml
-# Specific time window, history only
+# Specific time window
 action: pyscript.backfill_bayesian_sensor
 data:
   target_entity_id: binary_sensor.kitchen_occupied
@@ -148,45 +141,51 @@ data:
 
 ### Recommended workflow
 
-1. Run with `dry_run: true` and `debug: true`. Check the HA logs -- you should see a per-observation breakdown for the first 10 timestamps and a probability value that oscillates plausibly between 0 and 1.
+1. Run with `dry_run: true` and `debug: true`. Check the HA logs -- you should see a per-observation breakdown for the first 10 event timestamps and a probability value that oscillates plausibly between 0 and 1.
 2. Spot-check: pick a timestamp where you know the state of the observation entities. Hand-calculate the Bayes update and compare to the logged probability.
 3. Run without `dry_run`. The service is idempotent -- safe to re-run after modifying observation probabilities.
-4. Check the **History** panel -- the entity's `probability` attribute should now appear for the backfilled period.
+4. Check the **History** panel -- the entity's `probability` attribute should now appear for the backfilled period, with `occurred_observation_entities` and `observations` reflecting the correct state at each point in time.
 
-### How state history writes work
+### How it works in detail
 
-The service writes synthetic state records directly to the recorder's `states` table. Each record carries the full attribute set of the real sensor (device_class, friendly_name, observations list, etc.) with the computed `probability` value overlaid.
+The service computes probability at each observation entity **state change** rather than at fixed time intervals. This means:
 
-Key details:
+- A state record is written each time any observation entity changes state
+- No unnecessary rows are created during stable periods
+- State transitions are captured at the exact time they occurred
 
-- **Idempotent**: Backfill-written rows are tagged with `origin_idx=2`. Re-running deletes only those rows before reinserting, so real HA-recorded states are never affected.
-- **Retention-aware**: Rows older than your `purge_keep_days` setting (read from `configuration.yaml`, or inferred from the oldest state in the database, or defaulting to 10 days) are not written.
-- **State transitions**: `last_changed_ts` is only set when the binary state actually changes (on/off or off/on), matching HA's native recorder semantics.
-- **Attribute deduplication**: Identical attribute JSON blobs are shared via the `state_attributes` table, avoiding storage bloat.
+Each written state record includes the full attribute set:
+- **`probability`** -- the Bayesian probability at that moment
+- **`occurred_observation_entities`** -- entity IDs of observations that were active (evaluating True)
+- **`observations`** -- the full observation list from config, with `observed: false` on inactive observations
+
+Other attributes (`device_class`, `friendly_name`, `icon`, `probability_threshold`) are cloned from the most recent real HA-recorded state.
+
+**Idempotent**: Backfill rows are tagged with `origin_idx=2`. Re-running deletes only those rows before reinserting. Real HA-recorded states are never touched.
+
+**Non-blocking**: Writes are committed in batches of 500 rows to avoid holding a database lock that could block the HA recorder.
+
+**Retention-aware**: Rows older than your `purge_keep_days` setting are not written.
 
 ---
 
 ## Running the tests
-
-The test suite runs outside of Home Assistant using pytest. It covers solar elevation, state forward-fill, Bayes update formula, observation evaluation, Jinja2 historical mocks, SQLite state loading, YAML sensor discovery, UI config_entries lookup, purge_keep_days resolution, and state history write-back -- 104 tests in total.
 
 ```bash
 git clone https://github.com/maxlyth/homeassistant-bayesian-backfill.git
 cd homeassistant-bayesian-backfill
 
 python3 -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
+source .venv/bin/activate
 
 pip install -e ".[test]"
 pytest
 ```
 
-Expected output: `104 passed`.
+Expected output: `106 passed`.
 
-There are also two integration tests that run against a live HA instance:
+Integration tests against a live HA instance:
 
 ```bash
 HA_URL=http://supervisor/core HA_TOKEN=$SUPERVISOR_TOKEN pytest tests/test_integration.py -v
 ```
-
-These call the service via the REST API and verify log output and history API responses.
