@@ -1,14 +1,12 @@
 """
-Tests for backfill_bayesian.py.
+Tests for backfill_bayesian.
 
-Covers all pure-logic and DB-accessing functions. Executor-decorated functions run
-synchronously (conftest.py stubs @pyscript_executor to an identity decorator).
-The @service function (backfill_bayesian_sensor) is not tested here — it requires
-the full HA async runtime. See tests/test_integration.py for live HA tests.
+core.py is pure Python — imported directly, no pyscript stubs needed.
+The __init__.py (@service orchestration) requires the full HA async runtime
+and is tested via tests/test_integration.py against a live HA instance.
 """
 import asyncio
 import builtins
-import importlib.util
 import json
 import math
 import os
@@ -20,43 +18,59 @@ from pathlib import Path
 
 import pytest
 
-# ---------------------------------------------------------------------------
-# Load module under test
-# (conftest.py must have already injected pyscript builtins into builtins)
-# ---------------------------------------------------------------------------
-_MODULE_PATH = Path(__file__).parent.parent / "backfill_bayesian.py"
-
-
-def _load_module():
-    """
-    Load backfill_bayesian.py with pyscript-specific syntax normalised for CPython.
-
-    pyscript allows plain `def` functions decorated with `@service` to contain `await`
-    expressions. Standard Python's compiler rejects this. We pre-process the source to
-    convert `@service` + `def` into `async def` (dropping the decorator) so CPython can
-    compile and exec the module.
-    """
-    import re
-    import types
-
-    source = _MODULE_PATH.read_text()
-    # Convert "@service...\ndef name(" → "async def name(" so CPython accepts await inside.
-    source = re.sub(r"@service(?:\([^)]*\))?\s*\ndef\s+", "async def ", source)
-
-    mod = types.ModuleType("backfill_bayesian")
-    mod.__file__ = str(_MODULE_PATH)
-    # Make pyscript builtins available as module-level names during exec.
-    import builtins as _builtins
-    for _name in ("pyscript_executor", "service", "log", "task", "hass"):
-        setattr(mod, _name, getattr(_builtins, _name))
-    exec(compile(source, str(_MODULE_PATH), "exec"), mod.__dict__)
-    return mod
+# Import core.py directly by path to avoid loading __init__.py (which has
+# pyscript-specific syntax that CPython can't parse without preprocessing)
+import importlib.util
+_CORE_PATH = Path(__file__).parent.parent / "backfill_bayesian" / "core.py"
+_spec = importlib.util.spec_from_file_location("backfill_bayesian_core", _CORE_PATH)
+core = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(core)
 
 
 @pytest.fixture(scope="module")
 def m():
-    """Loaded backfill_bayesian module."""
-    return _load_module()
+    """The core module — pure Python, no pyscript dependencies."""
+    return core
+
+
+def _load_init_module():
+    """Load backfill_bayesian/__init__.py with pyscript syntax normalised for CPython.
+
+    The @service decorator allows plain `def` with `await` inside — CPython
+    rejects this. We rewrite to `async def` before compiling.
+    """
+    import re as _re
+    import types
+
+    init_path = Path(__file__).parent.parent / "backfill_bayesian" / "__init__.py"
+    source = init_path.read_text()
+    source = _re.sub(r"@service(?:\([^)]*\))?\s*\ndef\s+", "async def ", source)
+    # Strip pyscript-specific lines that won't work in standard Python
+    source = source.replace(
+        "from .core import", "from backfill_bayesian_core import"
+    )
+    source = _re.sub(r"# __file__.*?\n_CORE_PY_PATH = .*?\n", "", source)
+    source = _re.sub(
+        r"import importlib\.util as _ilu\n.*?_spec\.loader\.exec_module\(_raw_core\)\n",
+        "_raw_core = _ilu_placeholder\n",
+        source, flags=_re.DOTALL,
+    )
+
+    mod = types.ModuleType("backfill_bayesian_init")
+    mod.__file__ = str(init_path)
+    import builtins as _builtins
+    for _name in ("pyscript_executor", "service", "log", "task", "hass"):
+        setattr(mod, _name, getattr(_builtins, _name, lambda fn: fn))
+    # In tests, core is a plain Python module (not pyscript-wrapped), so
+    # _raw_core and the from-import names are all the same real functions.
+    import sys as _sys
+    _sys.modules["backfill_bayesian_core"] = core
+    mod._ilu_placeholder = core  # _raw_core = core
+    mod._WRITE_BATCH_SIZE = core._WRITE_BATCH_SIZE
+    mod._BACKFILL_ORIGIN_IDX = core._BACKFILL_ORIGIN_IDX
+    exec(compile(source, str(init_path), "exec"), mod.__dict__)
+    _sys.modules.pop("backfill_bayesian_core", None)
+    return mod
 
 
 # ===========================================================================
@@ -68,31 +82,31 @@ class TestSolarElevation:
     def test_midnight_is_below_horizon(self, m):
         # London (51.5°N, 0°W), 2024-06-21 00:00 UTC — sun well below horizon
         ts = datetime(2024, 6, 21, 0, 0, tzinfo=timezone.utc).timestamp()
-        elev = m._solar_elevation(ts, 51.5, 0.0)
+        elev = m.solar_elevation(ts, 51.5, 0.0)
         assert elev < 0, f"Expected negative at midnight, got {elev:.2f}°"
 
     def test_noon_is_above_horizon(self, m):
         # London, 2024-06-21 ~12:00 UTC — sun well above horizon (summer)
         ts = datetime(2024, 6, 21, 12, 0, tzinfo=timezone.utc).timestamp()
-        elev = m._solar_elevation(ts, 51.5, 0.0)
+        elev = m.solar_elevation(ts, 51.5, 0.0)
         assert elev > 50, f"Expected >50° at summer noon London, got {elev:.2f}°"
 
     def test_winter_noon_lower_than_summer(self, m):
         summer_ts = datetime(2024, 6, 21, 12, 0, tzinfo=timezone.utc).timestamp()
         winter_ts = datetime(2024, 12, 21, 12, 0, tzinfo=timezone.utc).timestamp()
-        summer = m._solar_elevation(summer_ts, 51.5, 0.0)
-        winter = m._solar_elevation(winter_ts, 51.5, 0.0)
+        summer = m.solar_elevation(summer_ts, 51.5, 0.0)
+        winter = m.solar_elevation(winter_ts, 51.5, 0.0)
         assert summer > winter, f"Summer ({summer:.1f}°) should exceed winter ({winter:.1f}°)"
 
     def test_equatorial_noon_near_90(self, m):
         # Near equator on equinox at solar noon → elevation ≈ 90°
         ts = datetime(2024, 3, 20, 12, 0, tzinfo=timezone.utc).timestamp()
-        elev = m._solar_elevation(ts, 0.0, 0.0)
+        elev = m.solar_elevation(ts, 0.0, 0.0)
         assert 80 < elev <= 90, f"Expected near 90° at equatorial equinox noon, got {elev:.2f}°"
 
     def test_returns_float(self, m):
         ts = datetime(2024, 6, 21, 6, 0, tzinfo=timezone.utc).timestamp()
-        result = m._solar_elevation(ts, 51.5, -0.23)
+        result = m.solar_elevation(ts, 51.5, -0.23)
         assert isinstance(result, float)
 
 
@@ -113,31 +127,31 @@ def timeline():
 
 class TestGetStateAt:
     def test_before_first_entry_returns_none(self, m, timeline):
-        assert m._get_state_at(timeline, 500.0) is None
+        assert m.get_state_at(timeline, 500.0) is None
 
     def test_exactly_at_first_entry(self, m, timeline):
-        assert m._get_state_at(timeline, 1000.0) == "off"
+        assert m.get_state_at(timeline, 1000.0) == "off"
 
     def test_between_entries_returns_previous(self, m, timeline):
-        assert m._get_state_at(timeline, 1500.0) == "off"
-        assert m._get_state_at(timeline, 2500.0) == "on"
+        assert m.get_state_at(timeline, 1500.0) == "off"
+        assert m.get_state_at(timeline, 2500.0) == "on"
 
     def test_exactly_at_later_entry(self, m, timeline):
-        assert m._get_state_at(timeline, 2000.0) == "on"
+        assert m.get_state_at(timeline, 2000.0) == "on"
 
     def test_after_last_entry(self, m, timeline):
-        assert m._get_state_at(timeline, 9999.0) == "off"
+        assert m.get_state_at(timeline, 9999.0) == "off"
 
     def test_empty_timeline_returns_none(self, m):
-        assert m._get_state_at({"ts": [], "state": [], "attrs": []}, 1000.0) is None
+        assert m.get_state_at({"ts": [], "state": [], "attrs": []}, 1000.0) is None
 
     def test_none_timeline_returns_none(self, m):
-        assert m._get_state_at(None, 1000.0) is None
+        assert m.get_state_at(None, 1000.0) is None
 
 
 class TestGetAttrAt:
     def test_no_attrs_returns_none(self, m, timeline):
-        assert m._get_attr_at(timeline, 2000.0, "brightness") is None
+        assert m.get_attr_at(timeline, 2000.0, "brightness") is None
 
     def test_returns_attribute_value(self, m):
         tl = {
@@ -145,9 +159,9 @@ class TestGetAttrAt:
             "state": ["on",   "on"],
             "attrs": ['{"brightness": 128}', '{"brightness": 200}'],
         }
-        assert m._get_attr_at(tl, 1000.0, "brightness") == 128
-        assert m._get_attr_at(tl, 1500.0, "brightness") == 128  # forward-fill
-        assert m._get_attr_at(tl, 2000.0, "brightness") == 200
+        assert m.get_attr_at(tl, 1000.0, "brightness") == 128
+        assert m.get_attr_at(tl, 1500.0, "brightness") == 128  # forward-fill
+        assert m.get_attr_at(tl, 2000.0, "brightness") == 200
 
     def test_missing_key_returns_none(self, m):
         tl = {
@@ -155,7 +169,7 @@ class TestGetAttrAt:
             "state": ["on"],
             "attrs": ['{"other_key": 42}'],
         }
-        assert m._get_attr_at(tl, 1000.0, "brightness") is None
+        assert m.get_attr_at(tl, 1000.0, "brightness") is None
 
     def test_invalid_json_returns_none(self, m):
         tl = {
@@ -163,7 +177,7 @@ class TestGetAttrAt:
             "state": ["on"],
             "attrs": ["not valid json"],
         }
-        assert m._get_attr_at(tl, 1000.0, "brightness") is None
+        assert m.get_attr_at(tl, 1000.0, "brightness") is None
 
 
 # ===========================================================================
@@ -178,48 +192,48 @@ class TestComputeBayesianProbability:
     def test_single_active_observation_raises_probability(self, m):
         obs = [_obs(0.9, 0.1)]
         # P = (0.5 * 0.9) / (0.5 * 0.9 + 0.5 * 0.1) = 0.9
-        result = m._compute_bayesian_probability(0.5, obs, [True])
+        result = m.compute_bayesian_probability(0.5, obs, [True])
         assert abs(result - 0.9) < 1e-4
 
     def test_single_inactive_observation_lowers_probability(self, m):
         obs = [_obs(0.9, 0.1)]
         # P = (0.5 * 0.1) / (0.5 * 0.1 + 0.5 * 0.9) = 0.1
-        result = m._compute_bayesian_probability(0.5, obs, [False])
+        result = m.compute_bayesian_probability(0.5, obs, [False])
         assert abs(result - 0.1) < 1e-4
 
     def test_skipped_observations_return_prior(self, m):
         obs = [_obs(0.9, 0.1), _obs(0.8, 0.2)]
-        result = m._compute_bayesian_probability(0.7, obs, [None, None])
+        result = m.compute_bayesian_probability(0.7, obs, [None, None])
         assert abs(result - 0.7) < 1e-4
 
     def test_multiple_observations_compound(self, m):
         obs = [_obs(0.9, 0.1), _obs(0.8, 0.2)]
-        result = m._compute_bayesian_probability(0.5, obs, [True, True])
+        result = m.compute_bayesian_probability(0.5, obs, [True, True])
         # Both active → probability should be very high
         assert result > 0.9
 
     def test_result_clamped_to_min(self, m):
         # Extreme: prior near 0, strong evidence against
         obs = [_obs(0.01, 0.99)] * 10
-        result = m._compute_bayesian_probability(0.01, obs, [False] * 10)
+        result = m.compute_bayesian_probability(0.01, obs, [False] * 10)
         assert result >= 0.0001
 
     def test_result_clamped_to_max(self, m):
         obs = [_obs(0.99, 0.01)] * 10
-        result = m._compute_bayesian_probability(0.99, obs, [True] * 10)
+        result = m.compute_bayesian_probability(0.99, obs, [True] * 10)
         assert result <= 0.9999
 
     def test_zero_denom_skips_observation(self, m):
         # p_true=1, p_false=1 → denom=0 for active → skip
         obs = [_obs(1.0, 1.0)]
-        result = m._compute_bayesian_probability(0.5, obs, [True])
+        result = m.compute_bayesian_probability(0.5, obs, [True])
         assert abs(result - 0.5) < 1e-4
 
     def test_mixed_active_and_skipped(self, m):
         obs = [_obs(0.9, 0.1), _obs(0.8, 0.2)]
         # Only first observation counts
-        result_mixed = m._compute_bayesian_probability(0.5, obs, [True, None])
-        result_single = m._compute_bayesian_probability(0.5, [obs[0]], [True])
+        result_mixed = m.compute_bayesian_probability(0.5, obs, [True, None])
+        result_single = m.compute_bayesian_probability(0.5, [obs[0]], [True])
         assert abs(result_mixed - result_single) < 1e-6
 
 
@@ -247,51 +261,51 @@ class TestEvaluateObservation:
         tl = {"binary_sensor.foo": self._tl([500.0], ["on"])}
         obs = {"platform": "state", "entity_id": "binary_sensor.foo", "to_state": "on"}
         ctx = self._ctx(1000.0)
-        assert m._evaluate_observation(obs, tl, {}, 0, ctx) is True
+        assert m.evaluate_observation(obs, tl, {}, 0, ctx) is True
 
     def test_state_inactive_when_no_match(self, m):
         tl = {"binary_sensor.foo": self._tl([500.0], ["off"])}
         obs = {"platform": "state", "entity_id": "binary_sensor.foo", "to_state": "on"}
-        assert m._evaluate_observation(obs, tl, {}, 0, self._ctx()) is False
+        assert m.evaluate_observation(obs, tl, {}, 0, self._ctx()) is False
 
     def test_state_skip_when_no_history(self, m):
         # Timeline exists but no entry before ts=100
         tl = {"binary_sensor.foo": self._tl([500.0], ["on"])}
         obs = {"platform": "state", "entity_id": "binary_sensor.foo", "to_state": "on"}
-        assert m._evaluate_observation(obs, tl, {}, 0, self._ctx(50.0)) is None
+        assert m.evaluate_observation(obs, tl, {}, 0, self._ctx(50.0)) is None
 
     def test_state_skip_when_entity_missing(self, m):
         obs = {"platform": "state", "entity_id": "binary_sensor.missing", "to_state": "on"}
-        assert m._evaluate_observation(obs, {}, {}, 0, self._ctx()) is None
+        assert m.evaluate_observation(obs, {}, {}, 0, self._ctx()) is None
 
     # --- numeric_state platform ---
 
     def test_numeric_below_threshold_active(self, m):
         tl = {"sensor.temp": self._tl([500.0], ["18.5"])}
         obs = {"platform": "numeric_state", "entity_id": "sensor.temp", "below": 20.0}
-        assert m._evaluate_observation(obs, tl, {}, 0, self._ctx()) is True
+        assert m.evaluate_observation(obs, tl, {}, 0, self._ctx()) is True
 
     def test_numeric_above_threshold_active(self, m):
         tl = {"sensor.temp": self._tl([500.0], ["25.0"])}
         obs = {"platform": "numeric_state", "entity_id": "sensor.temp", "above": 20.0}
-        assert m._evaluate_observation(obs, tl, {}, 0, self._ctx()) is True
+        assert m.evaluate_observation(obs, tl, {}, 0, self._ctx()) is True
 
     def test_numeric_above_and_below_active(self, m):
         tl = {"sensor.temp": self._tl([500.0], ["22.0"])}
         obs = {"platform": "numeric_state", "entity_id": "sensor.temp",
                "above": 20.0, "below": 25.0}
-        assert m._evaluate_observation(obs, tl, {}, 0, self._ctx()) is True
+        assert m.evaluate_observation(obs, tl, {}, 0, self._ctx()) is True
 
     def test_numeric_outside_range_inactive(self, m):
         tl = {"sensor.temp": self._tl([500.0], ["30.0"])}
         obs = {"platform": "numeric_state", "entity_id": "sensor.temp",
                "above": 20.0, "below": 25.0}
-        assert m._evaluate_observation(obs, tl, {}, 0, self._ctx()) is False
+        assert m.evaluate_observation(obs, tl, {}, 0, self._ctx()) is False
 
     def test_numeric_unavailable_state_skipped(self, m):
         tl = {"sensor.temp": self._tl([500.0], ["unavailable"])}
         obs = {"platform": "numeric_state", "entity_id": "sensor.temp", "below": 25.0}
-        assert m._evaluate_observation(obs, tl, {}, 0, self._ctx()) is None
+        assert m.evaluate_observation(obs, tl, {}, 0, self._ctx()) is None
 
     # --- template platform ---
 
@@ -300,23 +314,23 @@ class TestEvaluateObservation:
         env = jinja2.Environment()
         tpl = env.from_string("{{ True }}")
         obs = {"platform": "template", "value_template": "{{ True }}"}
-        assert m._evaluate_observation(obs, {}, {0: tpl}, 0, self._ctx()) is True
+        assert m.evaluate_observation(obs, {}, {0: tpl}, 0, self._ctx()) is True
 
     def test_template_false_result(self, m):
         jinja2 = pytest.importorskip("jinja2")
         env = jinja2.Environment()
         tpl = env.from_string("{{ False }}")
         obs = {"platform": "template", "value_template": "{{ False }}"}
-        assert m._evaluate_observation(obs, {}, {0: tpl}, 0, self._ctx()) is False
+        assert m.evaluate_observation(obs, {}, {0: tpl}, 0, self._ctx()) is False
 
     def test_template_missing_returns_false(self, m):
         obs = {"platform": "template", "value_template": "{{ True }}"}
         # No compiled template at index 0 → returns False (conservative)
-        assert m._evaluate_observation(obs, {}, {}, 0, self._ctx()) is False
+        assert m.evaluate_observation(obs, {}, {}, 0, self._ctx()) is False
 
     def test_unknown_platform_returns_none(self, m):
         obs = {"platform": "mystery"}
-        assert m._evaluate_observation(obs, {}, {}, 0, self._ctx()) is None
+        assert m.evaluate_observation(obs, {}, {}, 0, self._ctx()) is None
 
 
 # ===========================================================================
@@ -334,21 +348,21 @@ class TestBuildJinja2Env:
                 "attrs": [None],
             }
         }
-        env, ctx = m._build_jinja2_env(tl, 51.5, -0.23)
+        env, ctx = m.build_jinja2_env(tl, 51.5, -0.23)
         ctx["ts"] = 1000.0
         tpl = env.from_string("{{ states('sensor.foo') }}")
         assert tpl.render() == "on"
 
     def test_states_returns_unknown_for_missing_entity(self, m):
         pytest.importorskip("jinja2")
-        env, ctx = m._build_jinja2_env({}, 51.5, -0.23)
+        env, ctx = m.build_jinja2_env({}, 51.5, -0.23)
         ctx["ts"] = 1000.0
         tpl = env.from_string("{{ states('sensor.missing') }}")
         assert tpl.render() == "unknown"
 
     def test_now_reflects_historical_timestamp(self, m):
         pytest.importorskip("jinja2")
-        env, ctx = m._build_jinja2_env({}, 51.5, -0.23)
+        env, ctx = m.build_jinja2_env({}, 51.5, -0.23)
         ts = datetime(2024, 6, 21, 14, 30, tzinfo=timezone.utc).timestamp()
         ctx["ts"] = ts
         tpl = env.from_string("{{ now().hour }}")
@@ -356,7 +370,7 @@ class TestBuildJinja2Env:
 
     def test_state_attr_sun_elevation_is_numeric(self, m):
         pytest.importorskip("jinja2")
-        env, ctx = m._build_jinja2_env({}, 51.5, -0.23)
+        env, ctx = m.build_jinja2_env({}, 51.5, -0.23)
         ts = datetime(2024, 6, 21, 12, 0, tzinfo=timezone.utc).timestamp()
         ctx["ts"] = ts
         tpl = env.from_string("{{ state_attr('sun.sun', 'elevation') | float | round(0) }}")
@@ -366,7 +380,7 @@ class TestBuildJinja2Env:
 
     def test_time_dependent_template_uses_historical_hour(self, m):
         pytest.importorskip("jinja2")
-        env, ctx = m._build_jinja2_env({}, 51.5, -0.23)
+        env, ctx = m.build_jinja2_env({}, 51.5, -0.23)
         # Set ctx to a known hour (e.g. 22:00 UTC)
         ts = datetime(2024, 1, 15, 22, 0, tzinfo=timezone.utc).timestamp()
         ctx["ts"] = ts
@@ -422,20 +436,20 @@ def states_db(tmp_path):
 
 class TestLoadStateTimelines:
     def test_loads_correct_entity_ids(self, m, states_db):
-        result = m._load_state_timelines(
+        result = m.load_state_timelines(
             ["sensor.foo", "sensor.bar"], 500.0, 4000.0, False, states_db
         )
         assert "sensor.foo" in result
         assert "sensor.bar" in result
 
     def test_state_values_correct(self, m, states_db):
-        result = m._load_state_timelines(
+        result = m.load_state_timelines(
             ["sensor.foo"], 500.0, 4000.0, False, states_db
         )
         assert result["sensor.foo"]["state"] == ["off", "on"]
 
     def test_timestamps_sorted(self, m, states_db):
-        result = m._load_state_timelines(
+        result = m.load_state_timelines(
             ["sensor.foo"], 500.0, 4000.0, False, states_db
         )
         ts = result["sensor.foo"]["ts"]
@@ -443,13 +457,13 @@ class TestLoadStateTimelines:
 
     def test_1day_lookback_seed_included(self, m, states_db):
         # start_ts=1800 → lookback=1800-86400 < 1000, so the t=1000 entry should be included
-        result = m._load_state_timelines(
+        result = m.load_state_timelines(
             ["sensor.foo"], 1800.0, 4000.0, False, states_db
         )
         assert 1000.0 in result["sensor.foo"]["ts"]
 
     def test_attrs_loaded_when_requested(self, m, states_db):
-        result = m._load_state_timelines(
+        result = m.load_state_timelines(
             ["sensor.foo"], 500.0, 4000.0, True, states_db
         )
         attrs = result["sensor.foo"]["attrs"]
@@ -457,28 +471,28 @@ class TestLoadStateTimelines:
         assert json.loads(attrs[0])["brightness"] == 100
 
     def test_attrs_none_when_not_requested(self, m, states_db):
-        result = m._load_state_timelines(
+        result = m.load_state_timelines(
             ["sensor.foo"], 500.0, 4000.0, False, states_db
         )
         assert all(a is None for a in result["sensor.foo"]["attrs"])
 
     def test_missing_entity_not_in_result(self, m, states_db):
-        result = m._load_state_timelines(
+        result = m.load_state_timelines(
             ["sensor.missing"], 500.0, 4000.0, False, states_db
         )
         assert "sensor.missing" not in result
 
     def test_forward_fill_roundtrip(self, m, states_db):
         """Load timeline and verify get_state_at forward-fill is correct."""
-        result = m._load_state_timelines(
+        result = m.load_state_timelines(
             ["sensor.foo"], 500.0, 4000.0, False, states_db
         )
         tl = result["sensor.foo"]
-        assert m._get_state_at(tl, 999.0) is None      # before first entry
-        assert m._get_state_at(tl, 1000.0) == "off"    # exactly first
-        assert m._get_state_at(tl, 1500.0) == "off"    # between entries
-        assert m._get_state_at(tl, 2000.0) == "on"     # exactly second
-        assert m._get_state_at(tl, 9999.0) == "on"     # after last
+        assert m.get_state_at(tl, 999.0) is None      # before first entry
+        assert m.get_state_at(tl, 1000.0) == "off"    # exactly first
+        assert m.get_state_at(tl, 1500.0) == "off"    # between entries
+        assert m.get_state_at(tl, 2000.0) == "on"     # exactly second
+        assert m.get_state_at(tl, 9999.0) == "on"     # after last
 
 
 # ===========================================================================
@@ -526,7 +540,7 @@ def bayesian_yaml_dir(tmp_path):
 
 class TestLoadBayesianConfig:
     def test_finds_yaml_sensor_by_unique_id(self, m, bayesian_yaml_dir):
-        cfg = m._load_bayesian_config(
+        cfg = m.load_bayesian_config(
             "binary_sensor.my_test_sensor", str(bayesian_yaml_dir)
         )
         assert float(cfg["prior"]) == pytest.approx(0.3)
@@ -535,7 +549,7 @@ class TestLoadBayesianConfig:
 
     def test_raises_for_unknown_entity(self, m, bayesian_yaml_dir):
         with pytest.raises(ValueError, match="not found in entity registry"):
-            m._load_bayesian_config(
+            m.load_bayesian_config(
                 "binary_sensor.does_not_exist", str(bayesian_yaml_dir)
             )
 
@@ -557,7 +571,7 @@ class TestLoadBayesianConfig:
         storage.mkdir()
         (storage / "core.entity_registry").write_text(json.dumps(registry))
         with pytest.raises(ValueError, match="not found"):
-            m._load_bayesian_config("binary_sensor.orphan", str(tmp_path))
+            m.load_bayesian_config("binary_sensor.orphan", str(tmp_path))
 
     def test_finds_sensor_in_nested_package_yaml(self, m, tmp_path):
         """Sensors in package files live under a binary_sensor: key."""
@@ -594,7 +608,7 @@ binary_sensor:
         packages.mkdir()
         (packages / "activities.yaml").write_text(yaml_content)
 
-        cfg = m._load_bayesian_config("binary_sensor.package_sensor", str(tmp_path))
+        cfg = m.load_bayesian_config("binary_sensor.package_sensor", str(tmp_path))
         assert float(cfg["prior"]) == pytest.approx(0.5)
 
     def test_loads_ui_sensor_from_config_entries(self, m, tmp_path):
@@ -631,7 +645,7 @@ binary_sensor:
         (storage / "core.entity_registry").write_text(json.dumps(registry))
         (storage / "core.config_entries").write_text(json.dumps(config_entries))
 
-        cfg = m._load_bayesian_config("binary_sensor.ui_sensor", str(tmp_path))
+        cfg = m.load_bayesian_config("binary_sensor.ui_sensor", str(tmp_path))
         assert float(cfg["prior"]) == pytest.approx(0.6)
 
 
@@ -661,27 +675,27 @@ def registry_dir(tmp_path):
 
 class TestGetBayesianEntityIds:
     def test_exact_match_found(self, m, registry_dir):
-        result = m._get_bayesian_entity_ids(
+        result = m.get_bayesian_entity_ids(
             "binary_sensor.bathroom_has_light", str(registry_dir)
         )
         assert result == ["binary_sensor.bathroom_has_light"]
 
     def test_exact_match_non_bayesian_returns_empty(self, m, registry_dir):
-        result = m._get_bayesian_entity_ids("sensor.not_bayesian", str(registry_dir))
+        result = m.get_bayesian_entity_ids("sensor.not_bayesian", str(registry_dir))
         assert result == []
 
     def test_wildcard_matches_all_bayesian(self, m, registry_dir):
-        result = m._get_bayesian_entity_ids("binary_sensor.*", str(registry_dir))
+        result = m.get_bayesian_entity_ids("binary_sensor.*", str(registry_dir))
         assert len(result) == 4
         assert "sensor.not_bayesian" not in result
 
     def test_prefix_glob_matches_bathroom_only(self, m, registry_dir):
-        result = m._get_bayesian_entity_ids("binary_sensor.bathroom_*", str(registry_dir))
+        result = m.get_bayesian_entity_ids("binary_sensor.bathroom_*", str(registry_dir))
         assert len(result) == 2
         assert all("bathroom" in eid for eid in result)
 
     def test_no_match_returns_empty(self, m, registry_dir):
-        result = m._get_bayesian_entity_ids("binary_sensor.nonexistent_*", str(registry_dir))
+        result = m.get_bayesian_entity_ids("binary_sensor.nonexistent_*", str(registry_dir))
         assert result == []
 
 
@@ -696,7 +710,7 @@ class TestLoadLocation:
         storage.mkdir()
         config = {"data": {"latitude": 48.85, "longitude": 2.35}}
         (storage / "core.config").write_text(json.dumps(config))
-        lat, lon = m._load_location(str(tmp_path))
+        lat, lon = m.load_location(str(tmp_path))
         assert lat == pytest.approx(48.85)
         assert lon == pytest.approx(2.35)
 
@@ -704,7 +718,7 @@ class TestLoadLocation:
         storage = tmp_path / ".storage"
         storage.mkdir()
         (storage / "core.config").write_text(json.dumps({"data": {}}))
-        lat, lon = m._load_location(str(tmp_path))
+        lat, lon = m.load_location(str(tmp_path))
         assert lat == pytest.approx(0.0)
         assert lon == pytest.approx(0.0)
 
@@ -713,7 +727,7 @@ class TestLoadLocation:
         storage.mkdir()
         config = {"data": {"latitude": -33.87, "longitude": 151.21}}
         (storage / "core.config").write_text(json.dumps(config))
-        lat, lon = m._load_location(str(tmp_path))
+        lat, lon = m.load_location(str(tmp_path))
         assert lat == pytest.approx(-33.87)
         assert lon == pytest.approx(151.21)
 
@@ -726,15 +740,15 @@ class TestLoadLocation:
 class TestGetBayesianWindowStart:
     def test_returns_min_timestamp_across_entities(self, m, states_db):
         # sensor.foo first entry at t=1000, sensor.bar first at t=1500 → min=1000
-        result = m._get_bayesian_window_start(["sensor.foo", "sensor.bar"], states_db)
+        result = m.get_bayesian_window_start(["sensor.foo", "sensor.bar"], states_db)
         assert result == pytest.approx(1000.0)
 
     def test_single_entity_returns_its_earliest_timestamp(self, m, states_db):
-        result = m._get_bayesian_window_start(["sensor.bar"], states_db)
+        result = m.get_bayesian_window_start(["sensor.bar"], states_db)
         assert result == pytest.approx(1500.0)
 
     def test_missing_entity_returns_none(self, m, states_db):
-        result = m._get_bayesian_window_start(["sensor.nonexistent"], states_db)
+        result = m.get_bayesian_window_start(["sensor.nonexistent"], states_db)
         assert result is None
 
 
@@ -747,25 +761,25 @@ class TestComputeBayesianProbabilityEdgeCases:
     def test_prior_zero_with_all_skipped_is_clamped_to_min(self, m):
         # p stays 0.0 → clamped to 0.0001
         obs = [_obs(0.9, 0.1)]
-        result = m._compute_bayesian_probability(0.0, obs, [None])
+        result = m.compute_bayesian_probability(0.0, obs, [None])
         assert result == pytest.approx(0.0001)
 
     def test_prior_one_with_all_skipped_is_clamped_to_max(self, m):
         # p stays 1.0 → clamped to 0.9999
         obs = [_obs(0.9, 0.1)]
-        result = m._compute_bayesian_probability(1.0, obs, [None])
+        result = m.compute_bayesian_probability(1.0, obs, [None])
         assert result == pytest.approx(0.9999)
 
     def test_prior_zero_with_active_obs_is_clamped(self, m):
         # num = 0 * 0.9 = 0, denom = 0*0.9 + 1*0.1 = 0.1 → p=0 → clamped to 0.0001
         obs = [_obs(0.9, 0.1)]
-        result = m._compute_bayesian_probability(0.0, obs, [True])
+        result = m.compute_bayesian_probability(0.0, obs, [True])
         assert result == pytest.approx(0.0001)
 
     def test_prior_one_with_inactive_obs_is_clamped(self, m):
         # num = 1*(1-0.9) = 0.1, denom = 1*0.1 + 0*(1-0.1) = 0.1 → p=1.0 → clamped to 0.9999
         obs = [_obs(0.9, 0.1)]
-        result = m._compute_bayesian_probability(1.0, obs, [False])
+        result = m.compute_bayesian_probability(1.0, obs, [False])
         assert result == pytest.approx(0.9999)
 
 
@@ -784,29 +798,29 @@ class TestNumericStateBoundaryConditions:
     def test_value_equal_to_above_threshold_is_inactive(self, m):
         """Comparison is strict (val > above), so value == above must return False."""
         obs = {"platform": "numeric_state", "entity_id": "sensor.temp", "above": 20.0}
-        assert m._evaluate_observation(obs, self._tl(20.0), {}, 0, self._ctx()) is False
+        assert m.evaluate_observation(obs, self._tl(20.0), {}, 0, self._ctx()) is False
 
     def test_value_equal_to_below_threshold_is_inactive(self, m):
         """Comparison is strict (val < below), so value == below must return False."""
         obs = {"platform": "numeric_state", "entity_id": "sensor.temp", "below": 25.0}
-        assert m._evaluate_observation(obs, self._tl(25.0), {}, 0, self._ctx()) is False
+        assert m.evaluate_observation(obs, self._tl(25.0), {}, 0, self._ctx()) is False
 
     def test_value_just_above_lower_bound_is_active(self, m):
         obs = {"platform": "numeric_state", "entity_id": "sensor.temp", "above": 20.0}
-        assert m._evaluate_observation(obs, self._tl(20.001), {}, 0, self._ctx()) is True
+        assert m.evaluate_observation(obs, self._tl(20.001), {}, 0, self._ctx()) is True
 
     def test_value_just_below_upper_bound_is_active(self, m):
         obs = {"platform": "numeric_state", "entity_id": "sensor.temp", "below": 25.0}
-        assert m._evaluate_observation(obs, self._tl(24.999), {}, 0, self._ctx()) is True
+        assert m.evaluate_observation(obs, self._tl(24.999), {}, 0, self._ctx()) is True
 
     def test_negative_value_in_range(self, m):
         obs = {"platform": "numeric_state", "entity_id": "sensor.temp",
                "above": -10.0, "below": 0.0}
-        assert m._evaluate_observation(obs, self._tl(-5.0), {}, 0, self._ctx()) is True
+        assert m.evaluate_observation(obs, self._tl(-5.0), {}, 0, self._ctx()) is True
 
     def test_negative_value_at_boundary(self, m):
         obs = {"platform": "numeric_state", "entity_id": "sensor.temp", "above": -10.0}
-        assert m._evaluate_observation(obs, self._tl(-10.0), {}, 0, self._ctx()) is False
+        assert m.evaluate_observation(obs, self._tl(-10.0), {}, 0, self._ctx()) is False
 
 
 # ===========================================================================
@@ -820,14 +834,14 @@ class TestEvalTemplateExceptions:
         jinja2 = pytest.importorskip("jinja2")
         env = jinja2.Environment(undefined=jinja2.StrictUndefined)
         tpl = env.from_string("{{ undefined_variable }}")
-        assert m._eval_template(tpl, {"ts": 1000.0}) is False
+        assert m.eval_template(tpl, {"ts": 1000.0}) is False
 
     def test_falsy_strings_return_false(self, m):
         jinja2 = pytest.importorskip("jinja2")
         env = jinja2.Environment()
         for falsy in ("false", "False", "FALSE", "0", "off", "no", "unknown", ""):
             tpl = env.from_string(falsy)
-            result = m._eval_template(tpl, {"ts": 1000.0})
+            result = m.eval_template(tpl, {"ts": 1000.0})
             assert result is False, f"Expected False for {falsy!r}"
 
     def test_truthy_strings_return_true(self, m):
@@ -835,7 +849,7 @@ class TestEvalTemplateExceptions:
         env = jinja2.Environment()
         for truthy in ("true", "True", "TRUE", "1", "yes", "YES", "True  "):
             tpl = env.from_string(truthy)
-            result = m._eval_template(tpl, {"ts": 1000.0})
+            result = m.eval_template(tpl, {"ts": 1000.0})
             assert result is True, f"Expected True for {truthy!r}"
 
 
@@ -854,14 +868,14 @@ class TestBuildJinja2EnvStateAttr:
                 "attrs": ['{"brightness": 128}'],
             }
         }
-        env, ctx = m._build_jinja2_env(tl, 51.5, -0.23)
+        env, ctx = m.build_jinja2_env(tl, 51.5, -0.23)
         ctx["ts"] = 1000.0
         result = env.globals["state_attr"]("sensor.foo", "brightness")
         assert result == 128
 
     def test_state_attr_missing_entity_returns_none(self, m):
         pytest.importorskip("jinja2")
-        env, ctx = m._build_jinja2_env({}, 51.5, -0.23)
+        env, ctx = m.build_jinja2_env({}, 51.5, -0.23)
         ctx["ts"] = 1000.0
         result = env.globals["state_attr"]("sensor.missing", "brightness")
         assert result is None
@@ -875,7 +889,7 @@ class TestBuildJinja2EnvStateAttr:
                 "attrs": ['{"other_key": 42}'],
             }
         }
-        env, ctx = m._build_jinja2_env(tl, 51.5, -0.23)
+        env, ctx = m.build_jinja2_env(tl, 51.5, -0.23)
         ctx["ts"] = 1000.0
         result = env.globals["state_attr"]("sensor.foo", "brightness")
         assert result is None
@@ -889,7 +903,7 @@ class TestBuildJinja2EnvStateAttr:
                 "attrs": ['{"brightness": 50}'],
             }
         }
-        env, ctx = m._build_jinja2_env(tl, 51.5, -0.23)
+        env, ctx = m.build_jinja2_env(tl, 51.5, -0.23)
         ctx["ts"] = 1000.0  # before first entry at 5000
         result = env.globals["state_attr"]("sensor.foo", "brightness")
         assert result is None
@@ -935,7 +949,7 @@ class TestLoadBayesianConfigYAMLErrors:
   observations: []
 """)
 
-        cfg = m._load_bayesian_config("binary_sensor.skip_sensor", str(tmp_path))
+        cfg = m.load_bayesian_config("binary_sensor.skip_sensor", str(tmp_path))
         assert float(cfg["prior"]) == pytest.approx(0.35)
 
     def test_yaml_file_without_bayesian_platform_string_is_not_parsed(self, m, tmp_path):
@@ -972,7 +986,7 @@ class TestLoadBayesianConfigYAMLErrors:
   observations: []
 """)
 
-        cfg = m._load_bayesian_config("binary_sensor.only_sensor", str(tmp_path))
+        cfg = m.load_bayesian_config("binary_sensor.only_sensor", str(tmp_path))
         assert float(cfg["prior"]) == pytest.approx(0.55)
 
 
@@ -1047,18 +1061,22 @@ def backfill_db(tmp_path):
 
 
 @pytest.fixture
-def async_module(m):
-    """Wrap @pyscript_executor functions on the module as coroutines so they can be
-    awaited inside _backfill_single_bayesian.  Original functions are restored on teardown."""
+def async_module():
+    """Load __init__.py with pyscript stubs, wrapping executor functions as async.
+
+    The executor-decorated functions in __init__.py delegate to core.* which are
+    plain synchronous functions. We wrap them as coroutines so they can be awaited.
+    """
+    init_mod = _load_init_module()
     executor_fns = ("_get_bayesian_window_start", "_load_state_timelines",
                     "_load_existing_sensor_states",
                     "_prepare_history_write", "_write_history_batch")
-    originals = {name: getattr(m, name) for name in executor_fns}
+    originals = {name: getattr(init_mod, name) for name in executor_fns}
     for name in executor_fns:
-        setattr(m, name, _make_async(originals[name]))
-    yield m
+        setattr(init_mod, name, _make_async(originals[name]))
+    yield init_mod
     for name, orig in originals.items():
-        setattr(m, name, orig)
+        setattr(init_mod, name, orig)
 
 
 class TestBackfillSingleBayesian:
@@ -1244,20 +1262,20 @@ def purge_states_db(tmp_path):
 
 class TestReadPurgeKeepDays:
     def test_reads_from_configuration_yaml(self, m, purge_config_dir, purge_states_db):
-        result = m._read_purge_keep_days(str(purge_config_dir), purge_states_db)
+        result = m.read_purge_keep_days(str(purge_config_dir), purge_states_db)
         assert result == 400
 
     def test_falls_back_to_db_oldest_state(self, m, tmp_path, purge_states_db):
         """No configuration.yaml → use oldest state row to infer retention."""
         # tmp_path has no configuration.yaml
-        result = m._read_purge_keep_days(str(tmp_path), purge_states_db)
+        result = m.read_purge_keep_days(str(tmp_path), purge_states_db)
         # Oldest row is ~50 days ago; allow ±2 days for timing
         assert 48 <= result <= 52
 
     def test_falls_back_to_10_when_no_config_and_empty_db(self, m, tmp_path):
         """No config file and no DB → hardcoded default of 10."""
         missing_db = str(tmp_path / "nonexistent.db")
-        result = m._read_purge_keep_days(str(tmp_path), missing_db)
+        result = m.read_purge_keep_days(str(tmp_path), missing_db)
         assert result == 10
 
     def test_falls_back_to_10_when_db_has_no_states(self, m, tmp_path):
@@ -1269,7 +1287,7 @@ class TestReadPurgeKeepDays:
         )
         conn.commit()
         conn.close()
-        result = m._read_purge_keep_days(str(tmp_path), db_path)
+        result = m.read_purge_keep_days(str(tmp_path), db_path)
         assert result == 10
 
 
@@ -1352,7 +1370,7 @@ class TestWriteHistoryBatch:
         """Helper: prepare + write all rows in batches, like the real caller."""
         if not rows:
             return 0
-        metadata_id, base_attrs, old_state_id = m._prepare_history_write(
+        metadata_id, base_attrs, old_state_id = m.prepare_history_write(
             entity_id, db_path, rows[0]["ts"]
         )
         total = 0
@@ -1360,7 +1378,7 @@ class TestWriteHistoryBatch:
         batch_size = m._WRITE_BATCH_SIZE
         for i in range(0, len(rows), batch_size):
             batch = rows[i:i + batch_size]
-            inserted, old_state_id, prev_state_val = m._write_history_batch(
+            inserted, old_state_id, prev_state_val = m.write_history_batch(
                 batch, metadata_id, base_attrs, old_state_id, prev_state_val, db_path
             )
             total += inserted

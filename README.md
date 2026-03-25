@@ -69,26 +69,25 @@ pyscript:
 
 If you already have a `pyscript:` section, add `allow_all_imports: true` inside it.
 
-### Step 3 -- Download the script
+### Step 3 -- Download and install the app
 
-**Via HACS (for update notifications)**
-
-1. In HACS, go to the three-dot menu and select **Custom repositories**.
-2. Add `https://github.com/maxlyth/homeassistant-bayesian-backfill` with category **Python Script**.
-3. Find "Backfill Bayesian Sensor History" and download it.
-4. HACS places the file in `python_scripts/`. You must **move or copy** it to `pyscript/`:
-   ```bash
-   cp <config>/python_scripts/backfill_bayesian.py <config>/pyscript/
-   ```
-
-**Manual download**
-
-Copy `backfill_bayesian.py` from the [latest release](https://github.com/maxlyth/homeassistant-bayesian-backfill/releases) into the `pyscript/` directory inside your HA config folder:
+Copy the `backfill_bayesian/` directory into `pyscript/apps/` inside your HA config folder:
 
 ```
 <config>/
   pyscript/
-    backfill_bayesian.py
+    apps/
+      backfill_bayesian/
+        __init__.py
+        core.py
+        requirements.txt
+```
+
+You can download the files from the [latest release](https://github.com/maxlyth/homeassistant-bayesian-backfill/releases), or clone the repo and copy the directory:
+
+```bash
+git clone https://github.com/maxlyth/homeassistant-bayesian-backfill.git
+cp -r homeassistant-bayesian-backfill/backfill_bayesian <config>/pyscript/apps/
 ```
 
 | Install type | Config directory |
@@ -97,7 +96,18 @@ Copy `backfill_bayesian.py` from the [latest release](https://github.com/maxlyth
 | Home Assistant Container | Whatever you mapped to `/config` in your `docker run` / `compose.yaml` |
 | Home Assistant Core (venv) | `~/.homeassistant/` by default |
 
-### Step 4 -- Reload pyscript
+### Step 4 -- Register the app in configuration.yaml
+
+Add the app under the `pyscript:` section in your `configuration.yaml`:
+
+```yaml
+pyscript:
+  allow_all_imports: true
+  apps:
+    backfill_bayesian: {}
+```
+
+### Step 5 -- Reload pyscript
 
 In the HA UI: **Developer Tools > YAML > Reload pyscript**
 
@@ -107,7 +117,7 @@ Or call the service directly:
 action: pyscript.reload
 ```
 
-### Step 5 -- Verify
+### Step 6 -- Verify
 
 Go to **Developer Tools > Actions** and search for `pyscript.backfill_bayesian_sensor`. If it does not appear, check **Settings > System > Logs** for pyscript errors.
 
