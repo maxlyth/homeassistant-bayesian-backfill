@@ -1,3 +1,5 @@
+__version__ = "0.1.0"
+
 import bisect
 import fnmatch
 import json

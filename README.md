@@ -1,5 +1,9 @@
 # homeassistant-bayesian-backfill
 
+[![Tests](https://github.com/maxlyth/homeassistant-bayesian-backfill/actions/workflows/test.yml/badge.svg)](https://github.com/maxlyth/homeassistant-bayesian-backfill/actions/workflows/test.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![GitHub release](https://img.shields.io/github/v/release/maxlyth/homeassistant-bayesian-backfill)](https://github.com/maxlyth/homeassistant-bayesian-backfill/releases)
+
 A pyscript service that retroactively recomputes Bayesian binary sensor state history in Home Assistant. When observation probabilities (`prob_given_true`/`prob_given_false`) are changed, or a new Bayesian sensor is created, the existing history doesn't reflect the updated model. This service reconstructs the correct probability history from raw state data already in your recorder database and writes it directly to the states table so it appears in history graphs and ApexCharts attribute-history cards.
 
 ---
@@ -64,9 +68,21 @@ pyscript:
 
 If you already have a `pyscript:` section, add `allow_all_imports: true` inside it.
 
-### Step 3 -- Copy the script
+### Step 3 -- Download the script
 
-Copy `backfill_bayesian.py` into the `pyscript/` directory inside your HA config folder:
+**Via HACS (for update notifications)**
+
+1. In HACS, go to the three-dot menu and select **Custom repositories**.
+2. Add `https://github.com/maxlyth/homeassistant-bayesian-backfill` with category **Python Script**.
+3. Find "Backfill Bayesian Sensor History" and download it.
+4. HACS places the file in `python_scripts/`. You must **move or copy** it to `pyscript/`:
+   ```bash
+   cp <config>/python_scripts/backfill_bayesian.py <config>/pyscript/
+   ```
+
+**Manual download**
+
+Copy `backfill_bayesian.py` from the [latest release](https://github.com/maxlyth/homeassistant-bayesian-backfill/releases) into the `pyscript/` directory inside your HA config folder:
 
 ```
 <config>/
