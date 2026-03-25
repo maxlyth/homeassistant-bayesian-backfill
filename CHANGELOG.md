@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] - 2026-03-25
+
+### Changed
+- Restructured from single `backfill_bayesian.py` to pyscript app package (`backfill_bayesian/`)
+- Pure Python logic extracted to `backfill_bayesian/core.py` (no pyscript dependencies — fully testable in isolation)
+- Pyscript orchestration isolated in `backfill_bayesian/__init__.py`
+- Install path changed from `pyscript/backfill_bayesian.py` to `pyscript/apps/backfill_bayesian/`
+- Requires `pyscript.apps.backfill_bayesian: {}` in `configuration.yaml`
+- Version in `pyproject.toml` corrected to `0.2.0` (was incorrectly set to `1.0.0`)
+
+### Fixed
+- CI: excluded `backfill_bayesian` from setuptools auto-discovery to prevent byte-compile failures on pyscript-specific syntax in `__init__.py`
+
+[0.2.0]: https://github.com/maxlyth/homeassistant-bayesian-backfill/compare/v0.1.0...v0.2.0
+
 ## [0.1.0] - 2026-03-25
 
 ### Added

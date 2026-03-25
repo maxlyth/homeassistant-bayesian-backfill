@@ -209,7 +209,7 @@ pip install -e ".[test]"
 pytest
 ```
 
-Expected output: `106 passed`.
+Expected output: `109 passed`.
 
 Integration tests against a live HA instance:
 
