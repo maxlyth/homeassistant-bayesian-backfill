@@ -37,6 +37,7 @@ All paths are resolved at runtime from `hass.config.config_dir`, so the script w
 ## Prerequisites
 
 - Home Assistant (any recent version with the `recorder` integration enabled -- it is on by default)
+- **SQLite recorder database** (the default `home-assistant_v2.db`). This script reads and writes directly via `sqlite3` and is **not compatible** with alternative recorder backends such as MySQL, MariaDB, or PostgreSQL.
 - The [pyscript custom component](https://github.com/custom-components/pyscript) installed and enabled
 - `jinja2` -- bundled with Home Assistant, no separate install needed
 
