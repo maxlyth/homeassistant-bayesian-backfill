@@ -33,6 +33,22 @@ This service reconstructs the correct probability history retroactively from the
 
 ## Architecture
 
+### Module layout
+
+The service is structured as a pyscript app package in `backfill_bayesian/`:
+
+| File | Role |
+|---|---|
+| `core.py` | Pure Python logic — no pyscript, no HA, fully testable in isolation |
+| `__init__.py` | Pyscript orchestration — `@service`, `@pyscript_executor`, `hass`, `task`, `log` |
+| `requirements.txt` | Pip dependencies for pyscript (empty — `jinja2` is bundled with HA) |
+
+**Why two files?**
+
+Pyscript wraps all imported functions as async `EvalFuncVar` objects. `@pyscript_executor` threads run in plain Python and require regular synchronous callables. If `core.py` were imported normally, its functions would be wrapped and unusable from executors.
+
+`__init__.py` works around this by loading `core.py` a second time via `importlib.util` as a raw Python module (`_raw_core`). This module object is passed as a default argument (`_c=_raw_core`) to each `@pyscript_executor` wrapper, captured at function definition time before pyscript can wrap it.
+
 ### Config source lookup
 
 Sensor configuration is resolved at runtime — no hardcoded paths or sensor names:
@@ -72,21 +88,21 @@ Direct SQLite writes bypass HA's in-memory recorder cache, which causes duplicat
 
 ## Key functions
 
-| Function | Purpose |
-|---|---|
-| `_solar_elevation(ts, lat, lon)` | Pure Python solar elevation from timestamp + lat/lon |
-| `_load_location(config_dir)` | Read lat/lon from `.storage/core.config` |
-| `_get_bayesian_entity_ids(pattern, config_dir)` | Expand glob pattern against entity registry |
-| `_load_bayesian_config(entity_id, config_dir)` | Load config from UI storage or YAML scan |
-| `_get_bayesian_window_start(entity_ids, db_path)` | `MIN(last_updated_ts)` across observation entities |
-| `_load_state_timelines(entity_ids, ...)` | Bulk-load state histories via single SQL query |
-| `_get_state_at(timeline, ts)` | Forward-fill state lookup using `bisect` |
-| `_get_attr_at(timeline, ts, attr)` | Forward-fill attribute lookup using `bisect` |
-| `_build_jinja2_env(timelines, lat, lon)` | Mock Jinja2 env with historical `states()`, `state_attr()`, `now()` |
-| `_evaluate_observation(obs, ...)` | Dispatch by platform: `state` / `numeric_state` / `template` |
-| `_compute_bayesian_probability(prior, obs, results)` | Iterative Bayes update |
-| `_backfill_single_bayesian(...)` | Core logic for one sensor |
-| `backfill_bayesian_sensor(...)` | `@service` orchestrator; handles glob expansion |
+| Function | Module | Purpose |
+|---|---|---|
+| `solar_elevation(ts, lat, lon)` | `core.py` | Pure Python solar elevation from timestamp + lat/lon |
+| `load_location(config_dir)` | `core.py` | Read lat/lon from `.storage/core.config` |
+| `get_bayesian_entity_ids(pattern, config_dir)` | `core.py` | Expand glob pattern against entity registry |
+| `load_bayesian_config(entity_id, config_dir)` | `core.py` | Load config from UI storage or YAML scan |
+| `get_bayesian_window_start(entity_ids, db_path)` | `core.py` | `MIN(last_updated_ts)` across observation entities |
+| `load_state_timelines(entity_ids, ...)` | `core.py` | Bulk-load state histories via single SQL query |
+| `get_state_at(timeline, ts)` | `core.py` | Forward-fill state lookup using `bisect` |
+| `get_attr_at(timeline, ts, attr)` | `core.py` | Forward-fill attribute lookup using `bisect` |
+| `build_jinja2_env(timelines, lat, lon)` | `core.py` | Mock Jinja2 env with historical `states()`, `state_attr()`, `now()` |
+| `evaluate_observation(obs, ...)` | `core.py` | Dispatch by platform: `state` / `numeric_state` / `template` |
+| `compute_bayesian_probability(prior, obs, results)` | `core.py` | Iterative Bayes update |
+| `_backfill_single_bayesian(...)` | `__init__.py` | Async orchestration for one sensor |
+| `backfill_bayesian_sensor(...)` | `__init__.py` | `@service` entry point; handles glob expansion |
 
 ---
 
