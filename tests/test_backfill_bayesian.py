@@ -40,8 +40,8 @@ def _load_module():
     import types
 
     source = _MODULE_PATH.read_text()
-    # Convert "@service\ndef name(" → "async def name(" so CPython accepts await inside.
-    source = re.sub(r"@service\s*\ndef\s+", "async def ", source)
+    # Convert "@service...\ndef name(" → "async def name(" so CPython accepts await inside.
+    source = re.sub(r"@service(?:\([^)]*\))?\s*\ndef\s+", "async def ", source)
 
     mod = types.ModuleType("backfill_bayesian")
     mod.__file__ = str(_MODULE_PATH)
@@ -1051,7 +1051,8 @@ def async_module(m):
     """Wrap @pyscript_executor functions on the module as coroutines so they can be
     awaited inside _backfill_single_bayesian.  Original functions are restored on teardown."""
     executor_fns = ("_get_bayesian_window_start", "_load_state_timelines",
-                    "_write_bayesian_state_history")
+                    "_load_existing_sensor_states",
+                    "_prepare_history_write", "_write_history_batch")
     originals = {name: getattr(m, name) for name in executor_fns}
     for name in executor_fns:
         setattr(m, name, _make_async(originals[name]))
@@ -1083,89 +1084,118 @@ class TestBackfillSingleBayesian:
             ],
         }
 
-    def _run(self, m, cfg, *, start, end, interval_sec=3600, dry_run=False, db,
-             write_history=False):
-        return asyncio.run(
+    def _run(self, m, cfg, *, start, end, dry_run=False, db):
+        count, result = asyncio.run(
             m._backfill_single_bayesian(
                 "binary_sensor.test", cfg,
                 user_start_ts=start, end_ts=end,
-                interval_sec=interval_sec, dry_run=dry_run, debug=False,
+                dry_run=dry_run, debug=False,
                 db_path=db, lat=51.5, lon=0.0,
-                write_history=write_history,
             )
         )
+        return count, result
 
-    def test_returns_correct_row_count(self, async_module, backfill_db):
-        # Window [0, 10800), interval=3600 → timestamps 0, 3600, 7200 → 3 rows
-        rows = self._run(async_module, self._motion_cfg(), start=0.0, end=10800.0, db=backfill_db)
-        assert rows == 3
-
-    def test_dry_run_does_not_write_history(self, async_module, backfill_db):
-        self._run(async_module, self._motion_cfg(), start=0.0, end=10800.0,
-                  dry_run=True, db=backfill_db, write_history=True)
-        conn = sqlite3.connect(backfill_db)
-        count = conn.execute(
-            "SELECT COUNT(*) FROM states WHERE origin_idx = 2"
-        ).fetchone()[0]
-        conn.close()
-        assert count == 0
-
-    def test_computed_probabilities_match_bayes_formula(self, async_module, backfill_db):
-        """Verify end-to-end probability computation for known motion states."""
-        self._run(async_module, self._motion_cfg(prior=0.3), start=0.0, end=10800.0,
-                  db=backfill_db, write_history=True)
-        conn = sqlite3.connect(backfill_db)
+    def _read_backfill_rows(self, db_path):
+        """Read all backfill-written rows from the DB, ordered by timestamp."""
+        conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            "SELECT s.last_updated_ts, sa.shared_attrs FROM states s "
+            "SELECT s.last_updated_ts, s.state, sa.shared_attrs FROM states s "
             "JOIN state_attributes sa ON s.attributes_id = sa.attributes_id "
             "WHERE s.origin_idx = 2 ORDER BY s.last_updated_ts"
         ).fetchall()
         conn.close()
+        return rows
+
+    def test_returns_correct_row_count(self, async_module, backfill_db):
+        # motion has state changes at t=0, 3600, 7200 → 3 events in [0, 10800)
+        count, result = self._run(async_module, self._motion_cfg(), start=0.0, end=10800.0, db=backfill_db)
+        assert count == 3
+        assert result["events"] == 3
+
+    def test_dry_run_does_not_write_history(self, async_module, backfill_db):
+        count, result = self._run(async_module, self._motion_cfg(), start=0.0, end=10800.0,
+                                  dry_run=True, db=backfill_db)
+        conn = sqlite3.connect(backfill_db)
+        db_count = conn.execute(
+            "SELECT COUNT(*) FROM states WHERE origin_idx = 2"
+        ).fetchone()[0]
+        conn.close()
+        assert db_count == 0
+        assert "sample" in result  # dry_run includes sample
+
+    def test_computed_probabilities_match_bayes_formula(self, async_module, backfill_db):
+        """Verify end-to-end probability computation for known motion states."""
+        self._run(async_module, self._motion_cfg(prior=0.3), start=0.0, end=10800.0,
+                  db=backfill_db)
+        rows = self._read_backfill_rows(backfill_db)
         assert len(rows) == 3
         probs = [json.loads(r["shared_attrs"])["probability"] for r in rows]
-        # t=0: motion=on → P = 0.3*0.9 / (0.3*0.9 + 0.7*0.1)
         expected_on = 0.3 * 0.9 / (0.3 * 0.9 + 0.7 * 0.1)
-        # t=3600: motion=off → P = 0.3*0.1 / (0.3*0.1 + 0.7*0.9)
         expected_off = 0.3 * 0.1 / (0.3 * 0.1 + 0.7 * 0.9)
         assert abs(probs[0] - expected_on) < 1e-4
         assert abs(probs[1] - expected_off) < 1e-4
 
     def test_all_probabilities_within_clamped_range(self, async_module, backfill_db):
-        self._run(async_module, self._motion_cfg(), start=0.0, end=10800.0,
-                  db=backfill_db, write_history=True)
-        conn = sqlite3.connect(backfill_db)
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT sa.shared_attrs FROM states s "
-            "JOIN state_attributes sa ON s.attributes_id = sa.attributes_id "
-            "WHERE s.origin_idx = 2"
-        ).fetchall()
-        conn.close()
+        self._run(async_module, self._motion_cfg(), start=0.0, end=10800.0, db=backfill_db)
+        rows = self._read_backfill_rows(backfill_db)
         for r in rows:
             prob = json.loads(r["shared_attrs"])["probability"]
             assert 0.0001 <= prob <= 0.9999
 
     def test_empty_window_returns_zero_rows(self, async_module, backfill_db):
-        rows = self._run(async_module, self._motion_cfg(), start=10800.0, end=0.0,
-                         db=backfill_db)
-        assert rows == 0
+        count, result = self._run(async_module, self._motion_cfg(), start=10800.0, end=0.0,
+                                  db=backfill_db)
+        assert count == 0
 
-    def test_no_observations_uses_prior_for_every_row(self, async_module, backfill_db):
+    def test_no_observations_uses_prior(self, async_module, backfill_db):
+        """No observations → no timelines → single row at resolved_start with prior."""
         cfg = {"prior": 0.42, "probability_threshold": 0.5, "observations": []}
-        self._run(async_module, cfg, start=0.0, end=7200.0, db=backfill_db,
-                  write_history=True)
-        conn = sqlite3.connect(backfill_db)
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT sa.shared_attrs FROM states s "
-            "JOIN state_attributes sa ON s.attributes_id = sa.attributes_id "
-            "WHERE s.origin_idx = 2"
-        ).fetchall()
-        conn.close()
-        for r in rows:
-            prob = json.loads(r["shared_attrs"])["probability"]
-            assert abs(prob - 0.42) < 1e-4
+        count, result = self._run(async_module, cfg, start=0.0, end=7200.0, db=backfill_db)
+        assert count == 1
+        db_rows = self._read_backfill_rows(backfill_db)
+        assert len(db_rows) == 1
+        prob = json.loads(db_rows[0]["shared_attrs"])["probability"]
+        assert abs(prob - 0.42) < 1e-4
+
+    def test_occurred_observation_entities_reflects_active_observations(self, async_module, backfill_db):
+        self._run(async_module, self._motion_cfg(), start=0.0, end=10800.0, db=backfill_db)
+        rows = self._read_backfill_rows(backfill_db)
+        attrs_0 = json.loads(rows[0]["shared_attrs"])
+        assert "binary_sensor.motion" in attrs_0["occurred_observation_entities"]
+        attrs_1 = json.loads(rows[1]["shared_attrs"])
+        assert "binary_sensor.motion" not in attrs_1["occurred_observation_entities"]
+        attrs_2 = json.loads(rows[2]["shared_attrs"])
+        assert "binary_sensor.motion" in attrs_2["occurred_observation_entities"]
+
+    def test_observations_attribute_has_observed_false_on_inactive(self, async_module, backfill_db):
+        self._run(async_module, self._motion_cfg(), start=0.0, end=10800.0, db=backfill_db)
+        rows = self._read_backfill_rows(backfill_db)
+        obs_0 = json.loads(rows[0]["shared_attrs"])["observations"][0]
+        assert "observed" not in obs_0
+        obs_1 = json.loads(rows[1]["shared_attrs"])["observations"][0]
+        assert obs_1["observed"] is False
+
+    def test_result_contains_diff_and_timing(self, async_module, backfill_db):
+        count, result = self._run(async_module, self._motion_cfg(), start=0.0, end=10800.0,
+                                  db=backfill_db)
+        assert "diff" in result
+        assert result["diff"]["total_events"] == 3
+        assert "computation_seconds" in result
+        assert result["estimated_write_seconds"] >= 0
+
+    def test_result_warnings_for_missing_entity(self, async_module, backfill_db):
+        """Observation referencing an entity not in the DB should produce a warning."""
+        cfg = {
+            "prior": 0.5, "probability_threshold": 0.5,
+            "observations": [{
+                "platform": "state", "entity_id": "binary_sensor.nonexistent",
+                "to_state": "on", "prob_given_true": 0.9, "prob_given_false": 0.1,
+            }],
+        }
+        count, result = self._run(async_module, cfg, start=0.0, end=7200.0, db=backfill_db)
+        warning_types = [w["type"] for w in result["warnings"]]
+        assert "missing_entity_history" in warning_types
 
 
 # ===========================================================================
@@ -1308,23 +1338,42 @@ def _backfill_rows(start_ts, n, interval=3600.0, threshold=0.85):
             "ts": start_ts + i * interval,
             "probability": prob,
             "state": "on" if prob >= threshold else "off",
+            "occurred_observation_entities": ["binary_sensor.motion"] if prob >= threshold else [],
+            "observations": [{"platform": "state", "entity_id": "binary_sensor.motion",
+                              "to_state": "on", "prob_given_true": 0.9, "prob_given_false": 0.1}],
         })
     return rows
 
 
-class TestWriteBayesianStateHistory:
+class TestWriteHistoryBatch:
+    """Tests for _prepare_history_write + _write_history_batch."""
+
+    def _write_all(self, m, entity_id, rows, db_path):
+        """Helper: prepare + write all rows in batches, like the real caller."""
+        if not rows:
+            return 0
+        metadata_id, base_attrs, old_state_id = m._prepare_history_write(
+            entity_id, db_path, rows[0]["ts"]
+        )
+        total = 0
+        prev_state_val = None
+        batch_size = m._WRITE_BATCH_SIZE
+        for i in range(0, len(rows), batch_size):
+            batch = rows[i:i + batch_size]
+            inserted, old_state_id, prev_state_val = m._write_history_batch(
+                batch, metadata_id, base_attrs, old_state_id, prev_state_val, db_path
+            )
+            total += inserted
+        return total
+
     def test_returns_inserted_count(self, m, bayesian_states_db):
         rows = _backfill_rows(1000.0, 5)
-        inserted = m._write_bayesian_state_history(
-            "binary_sensor.test_bayesian", rows, bayesian_states_db
-        )
+        inserted = self._write_all(m, "binary_sensor.test_bayesian", rows, bayesian_states_db)
         assert inserted == 5
 
     def test_rows_written_to_db(self, m, bayesian_states_db):
         rows = _backfill_rows(1000.0, 3)
-        m._write_bayesian_state_history(
-            "binary_sensor.test_bayesian", rows, bayesian_states_db
-        )
+        self._write_all(m, "binary_sensor.test_bayesian", rows, bayesian_states_db)
         conn = sqlite3.connect(bayesian_states_db)
         count = conn.execute(
             "SELECT COUNT(*) FROM states WHERE metadata_id = 1 AND origin_idx = 2"
@@ -1333,10 +1382,9 @@ class TestWriteBayesianStateHistory:
         assert count == 3
 
     def test_probability_attribute_written(self, m, bayesian_states_db):
-        rows = [{"ts": 1000.0, "probability": 0.73, "state": "off"}]
-        m._write_bayesian_state_history(
-            "binary_sensor.test_bayesian", rows, bayesian_states_db
-        )
+        rows = [{"ts": 1000.0, "probability": 0.73, "state": "off",
+                 "occurred_observation_entities": [], "observations": []}]
+        self._write_all(m, "binary_sensor.test_bayesian", rows, bayesian_states_db)
         conn = sqlite3.connect(bayesian_states_db)
         conn.row_factory = sqlite3.Row
         row = conn.execute(
@@ -1349,11 +1397,28 @@ class TestWriteBayesianStateHistory:
         attrs = json.loads(row["shared_attrs"])
         assert abs(attrs["probability"] - 0.73) < 1e-6
 
+    def test_occurred_and_observations_written(self, m, bayesian_states_db):
+        obs_list = [{"platform": "state", "entity_id": "binary_sensor.motion",
+                     "to_state": "on", "prob_given_true": 0.9, "prob_given_false": 0.1}]
+        rows = [{"ts": 1000.0, "probability": 0.9, "state": "on",
+                 "occurred_observation_entities": ["binary_sensor.motion"],
+                 "observations": obs_list}]
+        self._write_all(m, "binary_sensor.test_bayesian", rows, bayesian_states_db)
+        conn = sqlite3.connect(bayesian_states_db)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT sa.shared_attrs FROM states s "
+            "JOIN state_attributes sa ON s.attributes_id = sa.attributes_id "
+            "WHERE s.metadata_id = 1 AND s.origin_idx = 2"
+        ).fetchone()
+        conn.close()
+        attrs = json.loads(row["shared_attrs"])
+        assert attrs["occurred_observation_entities"] == ["binary_sensor.motion"]
+        assert attrs["observations"] == obs_list
+
     def test_uses_backfill_origin_idx(self, m, bayesian_states_db):
         rows = _backfill_rows(1000.0, 4)
-        m._write_bayesian_state_history(
-            "binary_sensor.test_bayesian", rows, bayesian_states_db
-        )
+        self._write_all(m, "binary_sensor.test_bayesian", rows, bayesian_states_db)
         conn = sqlite3.connect(bayesian_states_db)
         origin_values = [
             r[0] for r in conn.execute(
@@ -1365,12 +1430,8 @@ class TestWriteBayesianStateHistory:
 
     def test_idempotent_reruns(self, m, bayesian_states_db):
         rows = _backfill_rows(1000.0, 5)
-        m._write_bayesian_state_history(
-            "binary_sensor.test_bayesian", rows, bayesian_states_db
-        )
-        m._write_bayesian_state_history(
-            "binary_sensor.test_bayesian", rows, bayesian_states_db
-        )
+        self._write_all(m, "binary_sensor.test_bayesian", rows, bayesian_states_db)
+        self._write_all(m, "binary_sensor.test_bayesian", rows, bayesian_states_db)
         conn = sqlite3.connect(bayesian_states_db)
         count = conn.execute(
             "SELECT COUNT(*) FROM states WHERE metadata_id = 1 AND origin_idx = 2"
@@ -1380,9 +1441,7 @@ class TestWriteBayesianStateHistory:
 
     def test_does_not_delete_real_states(self, m, bayesian_states_db):
         rows = _backfill_rows(100.0, 3)  # window overlaps the real state at t=500
-        m._write_bayesian_state_history(
-            "binary_sensor.test_bayesian", rows, bayesian_states_db
-        )
+        self._write_all(m, "binary_sensor.test_bayesian", rows, bayesian_states_db)
         conn = sqlite3.connect(bayesian_states_db)
         real_count = conn.execute(
             "SELECT COUNT(*) FROM states WHERE metadata_id = 1 AND origin_idx = 0"
@@ -1392,13 +1451,14 @@ class TestWriteBayesianStateHistory:
 
     def test_last_changed_ts_set_on_state_transition(self, m, bayesian_states_db):
         rows = [
-            {"ts": 1000.0, "probability": 0.95, "state": "on"},   # transition
-            {"ts": 2000.0, "probability": 0.90, "state": "on"},   # same state
-            {"ts": 3000.0, "probability": 0.05, "state": "off"},  # transition
+            {"ts": 1000.0, "probability": 0.95, "state": "on",
+             "occurred_observation_entities": [], "observations": []},
+            {"ts": 2000.0, "probability": 0.90, "state": "on",
+             "occurred_observation_entities": [], "observations": []},
+            {"ts": 3000.0, "probability": 0.05, "state": "off",
+             "occurred_observation_entities": [], "observations": []},
         ]
-        m._write_bayesian_state_history(
-            "binary_sensor.test_bayesian", rows, bayesian_states_db
-        )
+        self._write_all(m, "binary_sensor.test_bayesian", rows, bayesian_states_db)
         conn = sqlite3.connect(bayesian_states_db)
         results = conn.execute(
             "SELECT last_updated_ts, last_changed_ts FROM states "
@@ -1410,14 +1470,10 @@ class TestWriteBayesianStateHistory:
         assert results[2][1] == 3000.0   # transition: changed
 
     def test_empty_rows_returns_zero(self, m, bayesian_states_db):
-        result = m._write_bayesian_state_history(
-            "binary_sensor.test_bayesian", [], bayesian_states_db
-        )
+        result = self._write_all(m, "binary_sensor.test_bayesian", [], bayesian_states_db)
         assert result == 0
 
     def test_missing_entity_raises(self, m, bayesian_states_db):
         rows = _backfill_rows(1000.0, 2)
         with pytest.raises(ValueError, match="No states_meta entry"):
-            m._write_bayesian_state_history(
-                "binary_sensor.nonexistent", rows, bayesian_states_db
-            )
+            self._write_all(m, "binary_sensor.nonexistent", rows, bayesian_states_db)

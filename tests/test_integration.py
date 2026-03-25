@@ -128,7 +128,7 @@ class TestBackfillBayesianSensorIntegration:
 
 
     def test_write_history_populates_probability_attribute(self, ha_session):
-        """write_history=True over a 2-hour window writes states with probability attribute."""
+        """Backfill over a 2-hour window writes states with probability attribute."""
         _WRITE_WAIT = 20  # real DB write needs more headroom than dry_run
         t0 = datetime.now(timezone.utc)
 
@@ -142,7 +142,6 @@ class TestBackfillBayesianSensorIntegration:
                 "end_offset": {"hours": 0},
                 "dry_run": False,
                 "debug": True,
-                "write_history": True,
             },
         )
         assert resp.status_code == 200, (
@@ -179,5 +178,5 @@ class TestBackfillBayesianSensorIntegration:
         ]
         assert prob_values, (
             "No state records with 'probability' attribute found in history. "
-            "write_history may not have run or states were not committed."
+            "Backfill may not have run or states were not committed."
         )
