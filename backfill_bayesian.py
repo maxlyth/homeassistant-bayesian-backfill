@@ -196,22 +196,13 @@ _WRITE_BATCH_SIZE = 500  # rows per DB commit to avoid blocking HA recorder
 
 
 @pyscript_executor
-def _write_bayesian_state_history(entity_id, rows, db_path):
-    """Write synthetic state records (with probability attribute) to the states table.
+def _prepare_history_write(entity_id, db_path, min_ts):
+    """Look up metadata and base attributes for state history writes.
 
-    rows: list of dicts sorted ascending by ts, each containing:
-        ts, probability, state, occurred_observation_entities, observations.
-
-    Uses origin_idx=_BACKFILL_ORIGIN_IDX to mark synthetic rows so re-runs only
-    delete/replace those, leaving real HA-recorded states untouched.
-
-    Commits in batches of _WRITE_BATCH_SIZE to avoid holding a write lock that
-    blocks the HA recorder.
+    Returns (metadata_id, base_attrs, old_state_id) or raises ValueError.
+    Opens and closes its own connection — does not hold a lock.
     """
-    if not rows:
-        return 0
-
-    conn = sqlite3.connect(db_path, timeout=30)
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=30)
     conn.row_factory = sqlite3.Row
     try:
         meta = conn.execute(
@@ -221,7 +212,6 @@ def _write_bayesian_state_history(entity_id, rows, db_path):
             raise ValueError(f"No states_meta entry for {entity_id}")
         metadata_id = meta["metadata_id"]
 
-        # Use most recent real state as the static attributes template
         recent = conn.execute(
             "SELECT sa.shared_attrs FROM states s "
             "LEFT JOIN state_attributes sa ON s.attributes_id = sa.attributes_id "
@@ -233,8 +223,6 @@ def _write_bayesian_state_history(entity_id, rows, db_path):
             raise ValueError(f"No existing real state for {entity_id} to use as attributes template")
         base_attrs = json.loads(recent["shared_attrs"])
 
-        # Chain from the last real state before the window
-        min_ts = rows[0]["ts"]
         prev = conn.execute(
             "SELECT state_id FROM states WHERE metadata_id = ? AND last_updated_ts < ? "
             "ORDER BY last_updated_ts DESC LIMIT 1",
@@ -242,80 +230,83 @@ def _write_bayesian_state_history(entity_id, rows, db_path):
         ).fetchone()
         old_state_id = prev["state_id"] if prev else None
 
+        return metadata_id, base_attrs, old_state_id
+    finally:
+        conn.close()
+
+
+@pyscript_executor
+def _write_history_batch(batch, metadata_id, base_attrs, old_state_id, prev_state_val, db_path):
+    """Write one batch of state history rows. Opens/closes its own DB connection.
+
+    Returns (inserted_count, last_old_state_id, last_prev_state_val).
+    """
+    conn = sqlite3.connect(db_path, timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
+        batch_min_ts = batch[0]["ts"]
+        batch_max_ts = batch[-1]["ts"]
+
+        conn.execute(
+            "DELETE FROM states WHERE metadata_id = ? AND origin_idx = ? "
+            "AND last_updated_ts >= ? AND last_updated_ts <= ?",
+            (metadata_id, _BACKFILL_ORIGIN_IDX, batch_min_ts, batch_max_ts + 1),
+        )
+
         inserted = 0
-        prev_state_val = None
+        for row in batch:
+            ts = row["ts"]
+            prob = row["probability"]
+            state = row["state"]
 
-        for batch_start in range(0, len(rows), _WRITE_BATCH_SIZE):
-            batch = rows[batch_start:batch_start + _WRITE_BATCH_SIZE]
-            batch_min_ts = batch[0]["ts"]
-            batch_max_ts = batch[-1]["ts"]
-
-            # Delete previously backfilled rows in this batch's time range
-            conn.execute(
-                "DELETE FROM states WHERE metadata_id = ? AND origin_idx = ? "
-                "AND last_updated_ts >= ? AND last_updated_ts <= ?",
-                (metadata_id, _BACKFILL_ORIGIN_IDX, batch_min_ts, batch_max_ts + 1),
+            attrs = dict(base_attrs)
+            attrs["probability"] = round(prob, 6)
+            attrs["occurred_observation_entities"] = row.get(
+                "occurred_observation_entities", []
             )
+            attrs["observations"] = row.get("observations", [])
+            attrs_json = json.dumps(attrs, separators=(",", ":"), sort_keys=False)
+            attrs_hash = hash(attrs_json) & 0x7FFFFFFFFFFFFFFF
 
-            for row in batch:
-                ts = row["ts"]
-                prob = row["probability"]
-                state = row["state"]
-
-                # Build attributes: static base + dynamic per-row overlays
-                attrs = dict(base_attrs)
-                attrs["probability"] = round(prob, 6)
-                attrs["occurred_observation_entities"] = row.get(
-                    "occurred_observation_entities", []
-                )
-                attrs["observations"] = row.get("observations", [])
-                attrs_json = json.dumps(attrs, separators=(",", ":"), sort_keys=False)
-                attrs_hash = hash(attrs_json) & 0x7FFFFFFFFFFFFFFF
-
-                existing_attr = conn.execute(
-                    "SELECT attributes_id FROM state_attributes WHERE hash = ? AND shared_attrs = ?",
-                    (attrs_hash, attrs_json),
-                ).fetchone()
-                if existing_attr:
-                    attributes_id = existing_attr["attributes_id"]
-                else:
-                    conn.execute(
-                        "INSERT INTO state_attributes (hash, shared_attrs) VALUES (?, ?)",
-                        (attrs_hash, attrs_json),
-                    )
-                    attributes_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-
-                last_changed_ts = ts if state != prev_state_val else None
-
+            existing_attr = conn.execute(
+                "SELECT attributes_id FROM state_attributes WHERE hash = ? AND shared_attrs = ?",
+                (attrs_hash, attrs_json),
+            ).fetchone()
+            if existing_attr:
+                attributes_id = existing_attr["attributes_id"]
+            else:
                 conn.execute(
-                    """INSERT INTO states (
-                        state, last_updated_ts, last_changed_ts, last_reported_ts,
-                        old_state_id, attributes_id, context_id_bin, origin_idx, metadata_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        state, ts, last_changed_ts, ts,
-                        old_state_id, attributes_id, os.urandom(16),
-                        _BACKFILL_ORIGIN_IDX, metadata_id,
-                    ),
+                    "INSERT INTO state_attributes (hash, shared_attrs) VALUES (?, ?)",
+                    (attrs_hash, attrs_json),
                 )
-                old_state_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-                prev_state_val = state
-                inserted += 1
+                attributes_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
-            conn.commit()
+            last_changed_ts = ts if state != prev_state_val else None
 
-        return inserted
+            conn.execute(
+                """INSERT INTO states (
+                    state, last_updated_ts, last_changed_ts, last_reported_ts,
+                    old_state_id, attributes_id, context_id_bin, origin_idx, metadata_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    state, ts, last_changed_ts, ts,
+                    old_state_id, attributes_id, os.urandom(16),
+                    _BACKFILL_ORIGIN_IDX, metadata_id,
+                ),
+            )
+            old_state_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            prev_state_val = state
+            inserted += 1
+
+        conn.commit()
+        return inserted, old_state_id, prev_state_val
     finally:
         conn.close()
 
 
 @pyscript_executor
 def _get_bayesian_window_start(entity_ids, db_path):
-    """Return MIN(last_updated_ts) across all given entity_ids in the states table.
-
-    Two-step: resolve entity_ids → metadata_ids first, then query states using
-    the indexed metadata_id column to avoid a full-table scan on 100M+ rows.
-    """
+    """Return MIN(last_updated_ts) across all given entity_ids in the states table."""
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=30)
     try:
         placeholders = ",".join("?" * len(entity_ids))
@@ -541,7 +532,6 @@ async def _backfill_single_bayesian(
     observations = cfg.get("observations", [])
     prior = float(cfg.get("prior", 0.5))
     probability_threshold = float(cfg.get("probability_threshold", 0.5))
-    # Only per-timestamp debug detail uses the conditional level.
     debug_fn = log.warning if (dry_run or debug) else log.info
 
     # Collect all entity_ids needed for state timeline loading
@@ -555,12 +545,11 @@ async def _backfill_single_bayesian(
             for match in re.findall(
                 r"(?:states|state_attr)\(\s*['\"]([^'\"]+)['\"]", tpl_str
             ):
-                if match != "sun.sun":  # handled astronomically, no DB lookup
+                if match != "sun.sun":
                     obs_entity_ids.add(match)
 
     obs_entity_ids_list = list(obs_entity_ids)
 
-    # Need attrs join if any template uses state_attr for non-sun entities
     load_attrs = False
     for _obs in observations:
         if _obs.get("platform") == "template" and "state_attr(" in _obs.get("value_template", ""):
@@ -570,7 +559,6 @@ async def _backfill_single_bayesian(
     # Resolve start_ts (per-sensor when not specified by user)
     if user_start_ts is None:
         if dry_run or debug:
-            # Safety cap: 10-minute window when dry_run/debug to avoid accidental full scans
             resolved_start = int(end_ts - 600)
         elif obs_entity_ids_list:
             raw_start = await _get_bayesian_window_start(obs_entity_ids_list, db_path)
@@ -592,14 +580,14 @@ async def _backfill_single_bayesian(
         log.warning("backfill_bayesian: %s — window is empty, nothing to do", entity_id)
         return 0
 
-    # Bulk-load all state timelines in one query
+    # Bulk-load all state timelines (runs in executor thread)
     timelines = {}
     if obs_entity_ids_list:
         timelines = await _load_state_timelines(
             obs_entity_ids_list, resolved_start, end_ts, load_attrs, db_path
         )
 
-    # Collect unique state-change timestamps from all observation timelines
+    # Collect unique state-change timestamps
     event_timestamps = sorted({
         ts for tl in timelines.values()
         for ts in tl["ts"]
@@ -623,7 +611,7 @@ async def _backfill_single_bayesian(
     # Build Jinja2 environment with historical mocks
     env, ctx = _build_jinja2_env(timelines, lat, lon)
 
-    # Pre-compile all template observations
+    # Pre-compile template observations
     compiled_templates = {}
     for i, obs in enumerate(observations):
         if obs.get("platform") == "template":
@@ -635,12 +623,11 @@ async def _backfill_single_bayesian(
                     entity_id, i, exc,
                 )
 
-    # Main loop — iterate over observation entity state-change timestamps
+    # Main loop — iterate over event timestamps, yielding periodically
     history_rows = []
-    total_computed = 0
     debug_logged = 0
 
-    for ts in event_timestamps:
+    for idx, ts in enumerate(event_timestamps):
         ctx["ts"] = float(ts)
 
         obs_results = [
@@ -683,14 +670,28 @@ async def _backfill_single_bayesian(
             "occurred_observation_entities": occurred,
             "observations": obs_attrs,
         })
-        total_computed += 1
 
-    # Write state history
+        # Yield every 500 iterations to keep the event loop responsive
+        if (idx + 1) % _WRITE_BATCH_SIZE == 0:
+            await task.sleep(0)
+
+    # Write state history in batches, yielding between each
     if not dry_run and history_rows:
-        inserted = await _write_bayesian_state_history(entity_id, history_rows, db_path)
+        metadata_id, base_attrs, old_state_id = await _prepare_history_write(
+            entity_id, db_path, history_rows[0]["ts"]
+        )
+        total_inserted = 0
+        prev_state_val = None
+        for batch_start in range(0, len(history_rows), _WRITE_BATCH_SIZE):
+            batch = history_rows[batch_start:batch_start + _WRITE_BATCH_SIZE]
+            inserted, old_state_id, prev_state_val = await _write_history_batch(
+                batch, metadata_id, base_attrs, old_state_id, prev_state_val, db_path
+            )
+            total_inserted += inserted
+            await task.sleep(0.1)
         log.warning(
             "backfill_bayesian: %s — wrote %d state history row(s)",
-            entity_id, inserted,
+            entity_id, total_inserted,
         )
     elif dry_run and history_rows:
         log.warning(
@@ -700,7 +701,7 @@ async def _backfill_single_bayesian(
             datetime.fromtimestamp(history_rows[-1]["ts"], tz=timezone.utc).isoformat(),
         )
 
-    return total_computed
+    return len(history_rows)
 
 
 @service

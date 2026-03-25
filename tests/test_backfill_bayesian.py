@@ -1051,7 +1051,7 @@ def async_module(m):
     """Wrap @pyscript_executor functions on the module as coroutines so they can be
     awaited inside _backfill_single_bayesian.  Original functions are restored on teardown."""
     executor_fns = ("_get_bayesian_window_start", "_load_state_timelines",
-                    "_write_bayesian_state_history")
+                    "_prepare_history_write", "_write_history_batch")
     originals = {name: getattr(m, name) for name in executor_fns}
     for name in executor_fns:
         setattr(m, name, _make_async(originals[name]))
@@ -1327,19 +1327,35 @@ def _backfill_rows(start_ts, n, interval=3600.0, threshold=0.85):
     return rows
 
 
-class TestWriteBayesianStateHistory:
+class TestWriteHistoryBatch:
+    """Tests for _prepare_history_write + _write_history_batch."""
+
+    def _write_all(self, m, entity_id, rows, db_path):
+        """Helper: prepare + write all rows in batches, like the real caller."""
+        if not rows:
+            return 0
+        metadata_id, base_attrs, old_state_id = m._prepare_history_write(
+            entity_id, db_path, rows[0]["ts"]
+        )
+        total = 0
+        prev_state_val = None
+        batch_size = m._WRITE_BATCH_SIZE
+        for i in range(0, len(rows), batch_size):
+            batch = rows[i:i + batch_size]
+            inserted, old_state_id, prev_state_val = m._write_history_batch(
+                batch, metadata_id, base_attrs, old_state_id, prev_state_val, db_path
+            )
+            total += inserted
+        return total
+
     def test_returns_inserted_count(self, m, bayesian_states_db):
         rows = _backfill_rows(1000.0, 5)
-        inserted = m._write_bayesian_state_history(
-            "binary_sensor.test_bayesian", rows, bayesian_states_db
-        )
+        inserted = self._write_all(m, "binary_sensor.test_bayesian", rows, bayesian_states_db)
         assert inserted == 5
 
     def test_rows_written_to_db(self, m, bayesian_states_db):
         rows = _backfill_rows(1000.0, 3)
-        m._write_bayesian_state_history(
-            "binary_sensor.test_bayesian", rows, bayesian_states_db
-        )
+        self._write_all(m, "binary_sensor.test_bayesian", rows, bayesian_states_db)
         conn = sqlite3.connect(bayesian_states_db)
         count = conn.execute(
             "SELECT COUNT(*) FROM states WHERE metadata_id = 1 AND origin_idx = 2"
@@ -1350,9 +1366,7 @@ class TestWriteBayesianStateHistory:
     def test_probability_attribute_written(self, m, bayesian_states_db):
         rows = [{"ts": 1000.0, "probability": 0.73, "state": "off",
                  "occurred_observation_entities": [], "observations": []}]
-        m._write_bayesian_state_history(
-            "binary_sensor.test_bayesian", rows, bayesian_states_db
-        )
+        self._write_all(m, "binary_sensor.test_bayesian", rows, bayesian_states_db)
         conn = sqlite3.connect(bayesian_states_db)
         conn.row_factory = sqlite3.Row
         row = conn.execute(
@@ -1365,11 +1379,28 @@ class TestWriteBayesianStateHistory:
         attrs = json.loads(row["shared_attrs"])
         assert abs(attrs["probability"] - 0.73) < 1e-6
 
+    def test_occurred_and_observations_written(self, m, bayesian_states_db):
+        obs_list = [{"platform": "state", "entity_id": "binary_sensor.motion",
+                     "to_state": "on", "prob_given_true": 0.9, "prob_given_false": 0.1}]
+        rows = [{"ts": 1000.0, "probability": 0.9, "state": "on",
+                 "occurred_observation_entities": ["binary_sensor.motion"],
+                 "observations": obs_list}]
+        self._write_all(m, "binary_sensor.test_bayesian", rows, bayesian_states_db)
+        conn = sqlite3.connect(bayesian_states_db)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT sa.shared_attrs FROM states s "
+            "JOIN state_attributes sa ON s.attributes_id = sa.attributes_id "
+            "WHERE s.metadata_id = 1 AND s.origin_idx = 2"
+        ).fetchone()
+        conn.close()
+        attrs = json.loads(row["shared_attrs"])
+        assert attrs["occurred_observation_entities"] == ["binary_sensor.motion"]
+        assert attrs["observations"] == obs_list
+
     def test_uses_backfill_origin_idx(self, m, bayesian_states_db):
         rows = _backfill_rows(1000.0, 4)
-        m._write_bayesian_state_history(
-            "binary_sensor.test_bayesian", rows, bayesian_states_db
-        )
+        self._write_all(m, "binary_sensor.test_bayesian", rows, bayesian_states_db)
         conn = sqlite3.connect(bayesian_states_db)
         origin_values = [
             r[0] for r in conn.execute(
@@ -1381,12 +1412,8 @@ class TestWriteBayesianStateHistory:
 
     def test_idempotent_reruns(self, m, bayesian_states_db):
         rows = _backfill_rows(1000.0, 5)
-        m._write_bayesian_state_history(
-            "binary_sensor.test_bayesian", rows, bayesian_states_db
-        )
-        m._write_bayesian_state_history(
-            "binary_sensor.test_bayesian", rows, bayesian_states_db
-        )
+        self._write_all(m, "binary_sensor.test_bayesian", rows, bayesian_states_db)
+        self._write_all(m, "binary_sensor.test_bayesian", rows, bayesian_states_db)
         conn = sqlite3.connect(bayesian_states_db)
         count = conn.execute(
             "SELECT COUNT(*) FROM states WHERE metadata_id = 1 AND origin_idx = 2"
@@ -1396,9 +1423,7 @@ class TestWriteBayesianStateHistory:
 
     def test_does_not_delete_real_states(self, m, bayesian_states_db):
         rows = _backfill_rows(100.0, 3)  # window overlaps the real state at t=500
-        m._write_bayesian_state_history(
-            "binary_sensor.test_bayesian", rows, bayesian_states_db
-        )
+        self._write_all(m, "binary_sensor.test_bayesian", rows, bayesian_states_db)
         conn = sqlite3.connect(bayesian_states_db)
         real_count = conn.execute(
             "SELECT COUNT(*) FROM states WHERE metadata_id = 1 AND origin_idx = 0"
@@ -1415,9 +1440,7 @@ class TestWriteBayesianStateHistory:
             {"ts": 3000.0, "probability": 0.05, "state": "off",
              "occurred_observation_entities": [], "observations": []},
         ]
-        m._write_bayesian_state_history(
-            "binary_sensor.test_bayesian", rows, bayesian_states_db
-        )
+        self._write_all(m, "binary_sensor.test_bayesian", rows, bayesian_states_db)
         conn = sqlite3.connect(bayesian_states_db)
         results = conn.execute(
             "SELECT last_updated_ts, last_changed_ts FROM states "
@@ -1429,14 +1452,10 @@ class TestWriteBayesianStateHistory:
         assert results[2][1] == 3000.0   # transition: changed
 
     def test_empty_rows_returns_zero(self, m, bayesian_states_db):
-        result = m._write_bayesian_state_history(
-            "binary_sensor.test_bayesian", [], bayesian_states_db
-        )
+        result = self._write_all(m, "binary_sensor.test_bayesian", [], bayesian_states_db)
         assert result == 0
 
     def test_missing_entity_raises(self, m, bayesian_states_db):
         rows = _backfill_rows(1000.0, 2)
         with pytest.raises(ValueError, match="No states_meta entry"):
-            m._write_bayesian_state_history(
-                "binary_sensor.nonexistent", rows, bayesian_states_db
-            )
+            self._write_all(m, "binary_sensor.nonexistent", rows, bayesian_states_db)
