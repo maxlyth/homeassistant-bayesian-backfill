@@ -18,9 +18,7 @@ from .core import (
     write_history_batch as _core_write_history_batch,
     get_bayesian_window_start as _core_get_bayesian_window_start,
     load_state_timelines as _core_load_state_timelines,
-    build_jinja2_env as _core_build_jinja2_env,
-    evaluate_observation as _core_evaluate_observation,
-    compute_bayesian_probability as _core_compute_bayesian_probability,
+    compute_backfill_rows as _core_compute_backfill_rows,
     _WRITE_BATCH_SIZE,
     _BACKFILL_ORIGIN_IDX,
 )
@@ -82,6 +80,17 @@ def _load_state_timelines(entity_ids, start_ts, end_ts, load_attrs, db_path, _c=
     return _c.load_state_timelines(entity_ids, start_ts, end_ts, load_attrs, db_path)
 
 
+@pyscript_executor
+def _compute_backfill_rows(
+    observations, prior, probability_threshold, timelines,
+    resolved_start, end_ts, lat, lon, debug, _c=_raw_core,
+):
+    return _c.compute_backfill_rows(
+        observations, prior, probability_threshold, timelines,
+        resolved_start, end_ts, lat, lon, debug,
+    )
+
+
 async def _backfill_single_bayesian(
     entity_id, cfg, user_start_ts, end_ts, dry_run, debug, db_path, lat, lon,
 ):
@@ -93,7 +102,6 @@ async def _backfill_single_bayesian(
     observations = cfg.get("observations", [])
     prior = float(cfg.get("prior", 0.5))
     probability_threshold = float(cfg.get("probability_threshold", 0.5))
-    debug_fn = log.warning if (dry_run or debug) else log.info
     empty_result = {"entity_id": entity_id, "events": 0, "warnings": []}
 
     # Collect all entity_ids needed for state timeline loading
@@ -149,153 +157,43 @@ async def _backfill_single_bayesian(
             obs_entity_ids_list, resolved_start, end_ts, load_attrs, db_path
         )
 
-    # Collect unique state-change timestamps
-    event_timestamps = sorted({
-        ts for tl in timelines.values()
-        for ts in tl["ts"]
-        if resolved_start <= ts < end_ts
-    })
-    if not event_timestamps:
-        event_timestamps = [float(resolved_start)]
-
     log.warning(
-        "backfill_bayesian: %s — window=[%s → %s] "
-        "observations=%d entities=%d loaded=%d events=%d",
+        "backfill_bayesian: %s — window=[%s → %s] observations=%d entities=%d loaded=%d",
         entity_id,
         datetime.fromtimestamp(resolved_start, tz=timezone.utc).isoformat(),
         datetime.fromtimestamp(end_ts, tz=timezone.utc).isoformat(),
         len(observations),
         len(obs_entity_ids_list),
         len(timelines),
-        len(event_timestamps),
     )
 
-    # Build Jinja2 environment with historical mocks
-    env, ctx = _core_build_jinja2_env(timelines, lat, lon)
+    # Run computation in executor thread — keeps the HA event loop free
+    computed = await _compute_backfill_rows(
+        observations, prior, probability_threshold, timelines,
+        resolved_start, end_ts, lat, lon, debug,
+    )
+    history_rows = computed["history_rows"]
+    event_timestamps = computed["event_timestamps"]
+    warnings = computed["warnings"]
+    computation_seconds = computed["computation_seconds"]
 
-    # Pre-compile template observations
-    compiled_templates = {}
-    for i, obs in enumerate(observations):
-        if obs.get("platform") == "template":
-            try:
-                compiled_templates[i] = env.from_string(obs["value_template"])
-            except Exception as exc:
-                log.warning(
-                    "backfill_bayesian: %s — failed to compile template obs[%d]: %s",
-                    entity_id, i, exc,
-                )
+    for obs_idx, err_str in computed["template_errors"]:
+        log.warning(
+            "backfill_bayesian: %s — failed to compile template obs[%d]: %s",
+            entity_id, obs_idx, err_str,
+        )
+    if debug:
+        for msg in computed["debug_messages"]:
+            log.warning("backfill_bayesian [debug] %s %s", entity_id, msg)
 
-    # Main loop — iterate over event timestamps, yielding periodically
-    t_compute_start = time.time()
-    history_rows = []
-    debug_logged = 0
-    # Track per-observation activation counts for warnings
-    obs_active_counts = [0] * len(observations)
-    obs_eval_counts = [0] * len(observations)
+    log.warning(
+        "backfill_bayesian: %s — events=%d computation=%.2fs",
+        entity_id, len(history_rows), computation_seconds,
+    )
 
-    for idx, ts in enumerate(event_timestamps):
-        ctx["ts"] = float(ts)
-
-        obs_results = [
-            _core_evaluate_observation(obs, timelines, compiled_templates, i, ctx)
-            for i, obs in enumerate(observations)
-        ]
-        prob = _core_compute_bayesian_probability(prior, observations, obs_results)
-
-        # Track activation counts
-        for i, r in enumerate(obs_results):
-            if r is not None:
-                obs_eval_counts[i] += 1
-                if r is True:
-                    obs_active_counts[i] += 1
-
-        if debug and debug_logged < 10:
-            active_parts = [
-                f"obs[{i}]({'T' if r else 'F' if r is not None else '?'})"
-                for i, r in enumerate(obs_results)
-            ]
-            debug_fn(
-                "backfill_bayesian [debug] %s %s → prob=%.4f  [%s]",
-                entity_id,
-                datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
-                prob,
-                " ".join(active_parts),
-            )
-            debug_logged += 1
-
-        # Build per-timestamp dynamic attributes
-        occurred = []
-        obs_attrs = []
-        for i, obs in enumerate(observations):
-            obs_entry = dict(obs)
-            if obs_results[i] is True:
-                if obs.get("platform") in ("state", "numeric_state"):
-                    occurred.append(obs["entity_id"])
-                obs_entry.pop("observed", None)
-            else:
-                obs_entry["observed"] = False
-            obs_attrs.append(obs_entry)
-
-        history_rows.append({
-            "ts": float(ts),
-            "probability": prob,
-            "state": "on" if prob >= probability_threshold else "off",
-            "occurred_observation_entities": occurred,
-            "observations": obs_attrs,
-        })
-
-        # Yield every 500 iterations to keep the event loop responsive
-        if (idx + 1) % _WRITE_BATCH_SIZE == 0:
-            await task.sleep(0)
-
-    computation_seconds = round(time.time() - t_compute_start, 2)
     estimated_write_seconds = round(
         max(1, len(history_rows)) / _WRITE_BATCH_SIZE * 0.1, 2
     )
-
-    # --- Build warnings ---
-    warnings = []
-    for i, obs in enumerate(observations):
-        platform = obs.get("platform", "")
-        eid = obs.get("entity_id", "")
-
-        # Template with time-dependent expressions
-        if platform == "template":
-            tpl = obs.get("value_template", "")
-            if "now()" in tpl:
-                warnings.append({
-                    "type": "template_time_dependent",
-                    "observation_index": i,
-                    "detail": "Template uses now() — transitions between entity "
-                              "state changes are not captured",
-                })
-
-        # Missing entity history
-        if platform in ("state", "numeric_state") and eid and eid not in timelines:
-            warnings.append({
-                "type": "missing_entity_history",
-                "observation_index": i,
-                "entity_id": eid,
-                "detail": f"No state history found for {eid} in window",
-            })
-
-        # Always/never active
-        n_events = len(event_timestamps)
-        if n_events > 1 and obs_eval_counts[i] > 0:
-            if obs_active_counts[i] == obs_eval_counts[i]:
-                warnings.append({
-                    "type": "always_active",
-                    "observation_index": i,
-                    "entity_id": eid,
-                    "detail": f"Observation was active for all {obs_eval_counts[i]} evaluated events",
-                })
-            elif obs_active_counts[i] == 0:
-                warnings.append({
-                    "type": "never_active",
-                    "observation_index": i,
-                    "entity_id": eid,
-                    "detail": f"Observation was never active across {obs_eval_counts[i]} evaluated events",
-                })
 
     # --- Build diff against existing DB states ---
     existing = await _load_existing_sensor_states(

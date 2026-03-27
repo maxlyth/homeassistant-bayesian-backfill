@@ -1070,7 +1070,8 @@ def async_module():
     init_mod = _load_init_module()
     executor_fns = ("_get_bayesian_window_start", "_load_state_timelines",
                     "_load_existing_sensor_states",
-                    "_prepare_history_write", "_write_history_batch")
+                    "_prepare_history_write", "_write_history_batch",
+                    "_compute_backfill_rows")
     originals = {name: getattr(init_mod, name) for name in executor_fns}
     for name in executor_fns:
         setattr(init_mod, name, _make_async(originals[name]))
@@ -1495,3 +1496,208 @@ class TestWriteHistoryBatch:
         rows = _backfill_rows(1000.0, 2)
         with pytest.raises(ValueError, match="No states_meta entry"):
             self._write_all(m, "binary_sensor.nonexistent", rows, bayesian_states_db)
+
+
+# ===========================================================================
+# compute_backfill_rows
+# ===========================================================================
+
+
+def _state_obs(entity_id, to_state, p_true=0.9, p_false=0.1):
+    return {
+        "platform": "state",
+        "entity_id": entity_id,
+        "to_state": to_state,
+        "prob_given_true": p_true,
+        "prob_given_false": p_false,
+    }
+
+
+def _tl(ts_list, state_list):
+    return {"ts": list(ts_list), "state": list(state_list), "attrs": [None] * len(ts_list)}
+
+
+class TestComputeBackfillRows:
+    def test_returns_expected_keys(self, m):
+        observations = [_state_obs("binary_sensor.a", "on")]
+        timelines = {"binary_sensor.a": _tl([1000.0, 2000.0], ["off", "on"])}
+        result = m.compute_backfill_rows(
+            observations, prior=0.5, probability_threshold=0.5,
+            timelines=timelines, resolved_start=0.0, end_ts=3000.0,
+            lat=51.5, lon=0.0, debug=False,
+        )
+        for key in ("history_rows", "event_timestamps", "warnings",
+                    "computation_seconds", "debug_messages", "template_errors"):
+            assert key in result, f"Missing key: {key}"
+
+    def test_event_timestamps_from_timelines(self, m):
+        observations = [_state_obs("binary_sensor.a", "on")]
+        timelines = {"binary_sensor.a": _tl([1000.0, 2000.0, 2500.0], ["off", "on", "off"])}
+        result = m.compute_backfill_rows(
+            observations, 0.5, 0.5, timelines,
+            resolved_start=500.0, end_ts=3000.0,
+            lat=0.0, lon=0.0, debug=False,
+        )
+        # Only timestamps within [resolved_start, end_ts) are included
+        assert result["event_timestamps"] == [1000.0, 2000.0, 2500.0]
+
+    def test_event_timestamps_excludes_outside_window(self, m):
+        observations = [_state_obs("binary_sensor.a", "on")]
+        timelines = {"binary_sensor.a": _tl([100.0, 1500.0, 5000.0], ["off", "on", "off"])}
+        result = m.compute_backfill_rows(
+            observations, 0.5, 0.5, timelines,
+            resolved_start=500.0, end_ts=3000.0,
+            lat=0.0, lon=0.0, debug=False,
+        )
+        assert result["event_timestamps"] == [1500.0]
+
+    def test_fallback_single_row_when_no_events(self, m):
+        observations = [_state_obs("binary_sensor.a", "on")]
+        # Timeline has no entries in window
+        timelines = {"binary_sensor.a": _tl([], [])}
+        result = m.compute_backfill_rows(
+            observations, 0.5, 0.5, timelines,
+            resolved_start=1000.0, end_ts=2000.0,
+            lat=0.0, lon=0.0, debug=False,
+        )
+        assert result["event_timestamps"] == [1000.0]
+        assert len(result["history_rows"]) == 1
+
+    def test_state_row_reflects_probability(self, m):
+        observations = [_state_obs("binary_sensor.a", "on", p_true=0.9, p_false=0.1)]
+        timelines = {"binary_sensor.a": _tl([1000.0], ["on"])}
+        result = m.compute_backfill_rows(
+            observations, 0.5, 0.5, timelines,
+            resolved_start=500.0, end_ts=2000.0,
+            lat=0.0, lon=0.0, debug=False,
+        )
+        row = result["history_rows"][0]
+        assert abs(row["probability"] - 0.9) < 1e-4
+        assert row["state"] == "on"
+
+    def test_state_off_below_threshold(self, m):
+        # Entity "off" with p_true=0.9, p_false=0.1: inactive obs drives p to 0.1 → "off"
+        observations = [_state_obs("binary_sensor.a", "on", p_true=0.9, p_false=0.1)]
+        timelines = {"binary_sensor.a": _tl([1000.0], ["off"])}
+        result = m.compute_backfill_rows(
+            observations, 0.5, 0.5, timelines,
+            resolved_start=500.0, end_ts=2000.0,
+            lat=0.0, lon=0.0, debug=False,
+        )
+        row = result["history_rows"][0]
+        assert row["state"] == "off"
+
+    def test_occurred_entities_populated(self, m):
+        observations = [_state_obs("binary_sensor.a", "on")]
+        timelines = {"binary_sensor.a": _tl([1000.0], ["on"])}
+        result = m.compute_backfill_rows(
+            observations, 0.5, 0.5, timelines,
+            resolved_start=500.0, end_ts=2000.0,
+            lat=0.0, lon=0.0, debug=False,
+        )
+        assert "binary_sensor.a" in result["history_rows"][0]["occurred_observation_entities"]
+
+    def test_inactive_obs_gets_observed_false(self, m):
+        observations = [_state_obs("binary_sensor.a", "on")]
+        timelines = {"binary_sensor.a": _tl([1000.0], ["off"])}
+        result = m.compute_backfill_rows(
+            observations, 0.5, 0.5, timelines,
+            resolved_start=500.0, end_ts=2000.0,
+            lat=0.0, lon=0.0, debug=False,
+        )
+        obs_attrs = result["history_rows"][0]["observations"][0]
+        assert obs_attrs.get("observed") is False
+
+    def test_warning_missing_entity_history(self, m):
+        observations = [_state_obs("binary_sensor.missing", "on")]
+        timelines = {}  # no data for the entity
+        result = m.compute_backfill_rows(
+            observations, 0.5, 0.5, timelines,
+            resolved_start=0.0, end_ts=2000.0,
+            lat=0.0, lon=0.0, debug=False,
+        )
+        types = [w["type"] for w in result["warnings"]]
+        assert "missing_entity_history" in types
+
+    def test_warning_always_active(self, m):
+        observations = [_state_obs("binary_sensor.a", "on")]
+        # Entity is always "on" → always active warning
+        timelines = {"binary_sensor.a": _tl([1000.0, 2000.0], ["on", "on"])}
+        result = m.compute_backfill_rows(
+            observations, 0.5, 0.5, timelines,
+            resolved_start=500.0, end_ts=3000.0,
+            lat=0.0, lon=0.0, debug=False,
+        )
+        types = [w["type"] for w in result["warnings"]]
+        assert "always_active" in types
+
+    def test_warning_never_active(self, m):
+        observations = [_state_obs("binary_sensor.a", "on")]
+        # Entity is always "off" → never active warning
+        timelines = {"binary_sensor.a": _tl([1000.0, 2000.0], ["off", "off"])}
+        result = m.compute_backfill_rows(
+            observations, 0.5, 0.5, timelines,
+            resolved_start=500.0, end_ts=3000.0,
+            lat=0.0, lon=0.0, debug=False,
+        )
+        types = [w["type"] for w in result["warnings"]]
+        assert "never_active" in types
+
+    def test_debug_messages_populated_when_debug_true(self, m):
+        observations = [_state_obs("binary_sensor.a", "on")]
+        timelines = {"binary_sensor.a": _tl([1000.0, 2000.0], ["off", "on"])}
+        result = m.compute_backfill_rows(
+            observations, 0.5, 0.5, timelines,
+            resolved_start=500.0, end_ts=3000.0,
+            lat=0.0, lon=0.0, debug=True,
+        )
+        assert len(result["debug_messages"]) > 0
+
+    def test_debug_messages_empty_when_debug_false(self, m):
+        observations = [_state_obs("binary_sensor.a", "on")]
+        timelines = {"binary_sensor.a": _tl([1000.0], ["on"])}
+        result = m.compute_backfill_rows(
+            observations, 0.5, 0.5, timelines,
+            resolved_start=500.0, end_ts=2000.0,
+            lat=0.0, lon=0.0, debug=False,
+        )
+        assert result["debug_messages"] == []
+
+    def test_debug_messages_capped_at_10(self, m):
+        observations = [_state_obs("binary_sensor.a", "on")]
+        # 20 events — debug should only capture the first 10
+        ts_list = [float(1000 + i * 100) for i in range(20)]
+        state_list = ["on" if i % 2 == 0 else "off" for i in range(20)]
+        timelines = {"binary_sensor.a": _tl(ts_list, state_list)}
+        result = m.compute_backfill_rows(
+            observations, 0.5, 0.5, timelines,
+            resolved_start=500.0, end_ts=5000.0,
+            lat=0.0, lon=0.0, debug=True,
+        )
+        assert len(result["debug_messages"]) == 10
+
+    def test_template_error_captured(self, m):
+        observations = [{
+            "platform": "template",
+            "value_template": "{% this is invalid jinja %}",
+            "prob_given_true": 0.8,
+            "prob_given_false": 0.2,
+        }]
+        result = m.compute_backfill_rows(
+            observations, 0.5, 0.5, {},
+            resolved_start=0.0, end_ts=2000.0,
+            lat=0.0, lon=0.0, debug=False,
+        )
+        assert len(result["template_errors"]) == 1
+        assert result["template_errors"][0][0] == 0  # obs index
+
+    def test_computation_seconds_is_float(self, m):
+        observations = [_state_obs("binary_sensor.a", "on")]
+        timelines = {"binary_sensor.a": _tl([1000.0], ["on"])}
+        result = m.compute_backfill_rows(
+            observations, 0.5, 0.5, timelines,
+            resolved_start=500.0, end_ts=2000.0,
+            lat=0.0, lon=0.0, debug=False,
+        )
+        assert isinstance(result["computation_seconds"], float)
+        assert result["computation_seconds"] >= 0

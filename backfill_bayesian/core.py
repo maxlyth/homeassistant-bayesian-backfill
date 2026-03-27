@@ -1,6 +1,6 @@
 """Pure-Python Bayesian backfill logic — no pyscript dependencies."""
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 import bisect
 import fnmatch
@@ -553,3 +553,146 @@ def compute_bayesian_probability(prior, observations, obs_results):
             continue
         p = num / denom
     return max(0.0001, min(0.9999, round(p, 6)))
+
+
+def compute_backfill_rows(
+    observations, prior, probability_threshold, timelines,
+    resolved_start, end_ts, lat, lon, debug,
+):
+    """Compute all history rows for a single Bayesian sensor.
+
+    Runs entirely in a thread (no pyscript dependencies) — safe to call from
+    a @pyscript_executor without blocking the HA event loop.
+
+    Returns a dict with:
+      history_rows      — list of row dicts ready to write to the DB
+      event_timestamps  — sorted list of Unix timestamps that were evaluated
+      warnings          — list of warning dicts (miscalibration, missing history, etc.)
+      computation_seconds — wall-clock time spent in this function
+      debug_messages    — list of per-event debug strings (empty when debug=False)
+      template_errors   — list of (obs_index, error_str) for failed template compiles
+    """
+    # Collect unique state-change timestamps from all loaded timelines
+    event_timestamps = sorted({
+        ts for tl in timelines.values()
+        for ts in tl["ts"]
+        if resolved_start <= ts < end_ts
+    })
+    if not event_timestamps:
+        event_timestamps = [float(resolved_start)]
+
+    # Build Jinja2 environment with historical state mocks
+    env, ctx = build_jinja2_env(timelines, lat, lon)
+
+    # Pre-compile template observations; collect errors to surface via caller
+    compiled_templates = {}
+    template_errors = []
+    for i, obs in enumerate(observations):
+        if obs.get("platform") == "template":
+            try:
+                compiled_templates[i] = env.from_string(obs["value_template"])
+            except Exception as exc:
+                template_errors.append((i, str(exc)))
+
+    t_compute_start = time.time()
+    history_rows = []
+    debug_messages = []
+    obs_active_counts = [0] * len(observations)
+    obs_eval_counts = [0] * len(observations)
+
+    for ts in event_timestamps:
+        ctx["ts"] = float(ts)
+
+        obs_results = [
+            evaluate_observation(obs, timelines, compiled_templates, i, ctx)
+            for i, obs in enumerate(observations)
+        ]
+        prob = compute_bayesian_probability(prior, observations, obs_results)
+
+        for i, r in enumerate(obs_results):
+            if r is not None:
+                obs_eval_counts[i] += 1
+                if r is True:
+                    obs_active_counts[i] += 1
+
+        if debug and len(debug_messages) < 10:
+            active_parts = [
+                f"obs[{i}]({'T' if r else 'F' if r is not None else '?'})"
+                for i, r in enumerate(obs_results)
+            ]
+            debug_messages.append(
+                f"{datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()} "
+                f"→ prob={prob:.4f}  [{' '.join(active_parts)}]"
+            )
+
+        occurred = []
+        obs_attrs = []
+        for i, obs in enumerate(observations):
+            obs_entry = dict(obs)
+            if obs_results[i] is True:
+                if obs.get("platform") in ("state", "numeric_state"):
+                    occurred.append(obs["entity_id"])
+                obs_entry.pop("observed", None)
+            else:
+                obs_entry["observed"] = False
+            obs_attrs.append(obs_entry)
+
+        history_rows.append({
+            "ts": float(ts),
+            "probability": prob,
+            "state": "on" if prob >= probability_threshold else "off",
+            "occurred_observation_entities": occurred,
+            "observations": obs_attrs,
+        })
+
+    computation_seconds = round(time.time() - t_compute_start, 2)
+
+    # Build warnings
+    warnings = []
+    for i, obs in enumerate(observations):
+        platform = obs.get("platform", "")
+        eid = obs.get("entity_id", "")
+
+        if platform == "template":
+            tpl = obs.get("value_template", "")
+            if "now()" in tpl:
+                warnings.append({
+                    "type": "template_time_dependent",
+                    "observation_index": i,
+                    "detail": "Template uses now() — transitions between entity "
+                              "state changes are not captured",
+                })
+
+        if platform in ("state", "numeric_state") and eid and eid not in timelines:
+            warnings.append({
+                "type": "missing_entity_history",
+                "observation_index": i,
+                "entity_id": eid,
+                "detail": f"No state history found for {eid} in window",
+            })
+
+        n_events = len(event_timestamps)
+        if n_events > 1 and obs_eval_counts[i] > 0:
+            if obs_active_counts[i] == obs_eval_counts[i]:
+                warnings.append({
+                    "type": "always_active",
+                    "observation_index": i,
+                    "entity_id": eid,
+                    "detail": f"Observation was active for all {obs_eval_counts[i]} evaluated events",
+                })
+            elif obs_active_counts[i] == 0:
+                warnings.append({
+                    "type": "never_active",
+                    "observation_index": i,
+                    "entity_id": eid,
+                    "detail": f"Observation was never active across {obs_eval_counts[i]} evaluated events",
+                })
+
+    return {
+        "history_rows": history_rows,
+        "event_timestamps": event_timestamps,
+        "warnings": warnings,
+        "computation_seconds": computation_seconds,
+        "debug_messages": debug_messages,
+        "template_errors": template_errors,
+    }
